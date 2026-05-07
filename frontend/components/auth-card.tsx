@@ -1,11 +1,12 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
+import { ApiError, login, register } from "@/lib/api";
 
 type Tab = "login" | "register";
 
 type AuthCardProps = {
-  onAuthenticated?: () => void;
+  onAuthenticated?: (auth: { token: string; email: string }) => void;
 };
 const tabBaseClass =
   "auth-card-tab rounded-lg cursor-pointer border px-4 py-3 text-base font-semibold transition-[background,color,border-color] duration-200";
@@ -22,14 +23,49 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
   const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [showRegisterPassword, setShowRegisterPassword] = useState(false);
 
-  const onLoginSubmit = (e: FormEvent<HTMLFormElement>) => {
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [registerEmail, setRegisterEmail] = useState("");
+  const [registerPassword, setRegisterPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const onLoginSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    onAuthenticated?.();
+    setSubmitting(true);
+    setFormError(null);
+    try {
+      const res = await login(loginEmail.trim(), loginPassword);
+      onAuthenticated?.({ token: res.token, email: loginEmail.trim() });
+    } catch (err) {
+      if (err instanceof ApiError) setFormError(err.message);
+      else setFormError("Gagal masuk. Coba lagi.");
+    } finally {
+      setSubmitting(false);
+    }
   };
 
-  const onRegisterSubmit = (e: FormEvent<HTMLFormElement>) => {
+  const onRegisterSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    onAuthenticated?.();
+    setSubmitting(true);
+    setFormError(null);
+    try {
+      const email = registerEmail.trim();
+      await register({
+        email,
+        password: registerPassword,
+        public_key: "placeholder-public-key",
+        encrypted_private_key: "placeholder-encrypted-private-key",
+        kdf_params: { note: "placeholder" },
+      });
+      const res = await login(email, registerPassword);
+      onAuthenticated?.({ token: res.token, email });
+    } catch (err) {
+      if (err instanceof ApiError) setFormError(err.message);
+      else setFormError("Gagal daftar. Coba lagi.");
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -79,6 +115,8 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
               placeholder="nama@contoh.com"
               className={inputClass}
               autoComplete="email"
+              value={loginEmail}
+              onChange={(e) => setLoginEmail(e.target.value)}
             />
             <span
               className="auth-card-error block min-h-5 text-sm text-red-600"
@@ -95,6 +133,8 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
                 placeholder="••••••••"
                 className={inputClass}
                 autoComplete="current-password"
+                value={loginPassword}
+                onChange={(e) => setLoginPassword(e.target.value)}
               />
               <button
                 type="button"
@@ -115,6 +155,7 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
           <div className="auth-card-actions mt-6 flex justify-center">
             <button
               type="submit"
+              disabled={submitting}
               className="auth-card-btn auth-card-btn-primary cursor-pointer rounded-lg border-0 bg-[#42B549] px-6 py-3 text-base font-semibold text-white shadow-[0_2px_4px_rgba(0,0,0,0.1)] transition-[background-color,box-shadow] duration-200 font-inherit hover:bg-[#36933c] hover:shadow-[0_4px_8px_rgba(0,0,0,0.15)]"
             >
               <span>Masuk</span>
@@ -123,7 +164,9 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
           <div
             className="auth-card-form-error mt-2 min-h-5 text-center text-sm text-red-600"
             data-error="form"
-          />
+          >
+            {tab === "login" ? formError : null}
+          </div>
         </form>
 
         <form
@@ -142,6 +185,8 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
               placeholder="nama@contoh.com"
               className={inputClass}
               autoComplete="email"
+              value={registerEmail}
+              onChange={(e) => setRegisterEmail(e.target.value)}
             />
             <span
               className="auth-card-error block min-h-5 text-sm text-red-600"
@@ -155,9 +200,12 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
                 type={showRegisterPassword ? "text" : "password"}
                 name="password"
                 required
-                placeholder="••••••••"
+                minLength={6}
+                placeholder="********"
                 className={inputClass}
                 autoComplete="new-password"
+                value={registerPassword}
+                onChange={(e) => setRegisterPassword(e.target.value)}
               />
               <button
                 type="button"
@@ -178,6 +226,7 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
           <div className="auth-card-actions mt-6 flex justify-center">
             <button
               type="submit"
+              disabled={submitting}
               className="auth-card-btn auth-card-btn-primary cursor-pointer rounded-lg border-0 bg-[#42B549] px-6 py-3 text-base font-semibold text-white shadow-[0_2px_4px_rgba(0,0,0,0.1)] transition-[background-color,box-shadow] duration-200 font-inherit hover:bg-[#36933c] hover:shadow-[0_4px_8px_rgba(0,0,0,0.15)]"
             >
               <span>Daftar</span>
@@ -186,7 +235,9 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
           <div
             className="auth-card-form-error mt-2 min-h-5 text-center text-sm text-red-600"
             data-error="form"
-          />
+          >
+            {tab === "register" ? formError : null}
+          </div>
         </form>
       </div>
     </div>

@@ -24,7 +24,7 @@ def base64url_decode(s: str) -> bytes:
         s += '=' * padding
     return base64.urlsafe_b64decode(s)
 
-def sign(header: dict, private_key_pem: str, claims: dict = {}, payload: dict = {}) -> str:
+def sign_jwt(header: dict, private_key_pem: str, claims: dict = {}, payload: dict = {}) -> str:
     if not header.get('alg') or not header.get('typ'):
         raise ValueError('Header harus memiliki alg dan typ')
     if header['alg'] not in ALG_MAP:
@@ -63,7 +63,7 @@ def sign(header: dict, private_key_pem: str, claims: dict = {}, payload: dict = 
     return f"{signing_input}.{encoded_signature}"
 
 
-def verify(jwt_token: str, public_key_pem: str, options: dict = {}) -> dict:
+def verify_jwt(jwt_token: str, public_key_pem: str, options: dict = {}) -> dict:
     parts = jwt_token.split('.')
     if len(parts) != 3:
         raise ValueError('Format JWT tidak valid')

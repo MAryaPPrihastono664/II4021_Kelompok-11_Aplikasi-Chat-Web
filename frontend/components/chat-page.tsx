@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { ApiError, fetchContacts } from "@/lib/api";
 
 type Message = {
   id: number | null;
@@ -67,260 +68,109 @@ function RenderChatMessageText({ content }: { content: string }) {
   return <>{parts.length ? parts : content}</>;
 }
 
-const MOCK_USER_ID = 1;
-const MOCK_USER_ROLE = "BUYER" as const;
-
-const MOCK_PARTNERS: PartnerInfo[] = [
-  {
-    id: 2,
-    role: "SELLER",
-    name: "Budi",
-    storeId: 10,
-    storeName: "Warung Segar",
-    storeDescription: null,
-    storeLogoPath: null,
-  },
-  {
-    id: 3,
-    role: "SELLER",
-    name: "Ani",
-    storeId: 11,
-    storeName: "Tech Corner",
-    storeDescription: null,
-    storeLogoPath: null,
-  },
-];
-
-function initialMessages(): Map<number, Map<number | string, Message>> {
-  const rooms = new Map<number, Map<number | string, Message>>();
-  const r2 = new Map<number | string, Message>();
-  r2.set(101, {
-    id: 101,
-    fromUserId: 2,
-    toUserId: MOCK_USER_ID,
-    messageType: "text",
-    content: "Halo! Ada yang bisa dibantu?",
-    tracking: null,
-    isRead: true,
-    createdAt: new Date(Date.now() - 1000 * 60 * 60 * 3).toISOString(),
-  });
-  r2.set(102, {
-    id: 102,
-    fromUserId: MOCK_USER_ID,
-    toUserId: 2,
-    messageType: "text",
-    content: "Halo, saya mau tanya stok ya.",
-    tracking: null,
-    isRead: true,
-    createdAt: new Date(Date.now() - 1000 * 60 * 60 * 2).toISOString(),
-  });
-  rooms.set(2, r2);
-
-  const r3 = new Map<number | string, Message>();
-  r3.set(201, {
-    id: 201,
-    fromUserId: 3,
-    toUserId: MOCK_USER_ID,
-    messageType: "text",
-    content: "Pengiriman besok bisa?",
-    tracking: null,
-    isRead: false,
-    createdAt: new Date(Date.now() - 1000 * 60 * 30).toISOString(),
-  });
-  rooms.set(3, r3);
-  return rooms;
-}
-
-function NewChatModal({
-  close,
-  userRole,
-  allPartners,
-  onPick,
-}: {
-  close: () => void;
-  userRole: string;
-  allPartners: PartnerInfo[];
-  onPick: (id: number) => void;
-}) {
-  const [search, setSearch] = useState("");
-  const searchResults = useMemo(() => {
-    if (search.trim() === "") return [];
-    const q = search.toLowerCase();
-    const roles =
-      userRole === "SELLER"
-        ? ["BUYER"]
-        : userRole === "BUYER"
-          ? ["SELLER"]
-          : [];
-    return allPartners.filter(
-      (p) =>
-        (roles.length === 0 || roles.includes(p.role)) &&
-        (p.storeName ?? p.name).toLowerCase().includes(q),
-    );
-  }, [search, userRole, allPartners]);
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="animate-fade-in flex max-h-[90vh] w-[90%] max-w-md flex-col gap-4 rounded-xl bg-white p-5 shadow-lg">
-        <div className="flex items-center justify-between">
-          <h2 className="text-xl font-semibold text-[#333]">Chat Baru</h2>
-          <button
-            type="button"
-            onClick={close}
-            className="flex aspect-square items-center justify-center rounded-full p-2 text-2xl text-[#42B549] transition hover:bg-[#F0FFF1]"
-            aria-label="Tutup"
-          >
-            <i className="bx bx-x" />
-          </button>
-        </div>
-        <input
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="Cari pengguna..."
-          className="w-full rounded-xl border border-[#E5E5E5] px-4 py-3 text-[0.9375rem] outline-none transition focus:border-[#42B549]"
-        />
-        <div className="flex max-h-80 flex-col divide-y divide-[#F0F0F0] overflow-y-auto">
-          {searchResults.length === 0 ? (
-            <p className="py-6 text-center text-[#999]">
-              {search.trim() === ""
-                ? "Ketik untuk mencari"
-                : "Pengguna tidak ditemukan"}
-            </p>
-          ) : (
-            searchResults.map((s) => (
-              <button
-                type="button"
-                key={s.id}
-                onClick={() => {
-                  onPick(s.id);
-                  close();
-                }}
-                className="flex w-full cursor-pointer items-center gap-3 p-4 text-left transition hover:bg-[#F0FFF1]"
-              >
-                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#E5E5E5] text-xl text-[#42B549]">
-                  {s.storeLogoPath != null ? (
-                    <img
-                      src={s.storeLogoPath}
-                      alt=""
-                      className="h-full w-full overflow-hidden rounded-full border object-cover"
-                    />
-                  ) : (
-                    <i
-                      className={
-                        s.role === "SELLER" ? "bx bx-store" : "bx bx-user"
-                      }
-                    />
-                  )}
-                </div>
-                <p className="text-[0.9375rem] font-medium text-[#333]">
-                  {s.storeName ?? s.name}
-                </p>
-              </button>
-            ))
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function ChatSidebar({
   userId,
-  userRole,
   rooms,
   partnerById,
   activePartnerUserId,
-  setActivePartnerUserId,
-  chatEnabled,
-  chatDisabledReason,
-  onOpenNewChat,
+  onSelectPartner,
+  contactsLoading,
+  contactsError,
+  onRefreshContacts,
 }: {
   userId: number;
-  userRole: string;
   rooms: Map<number, Map<number | string, Message>>;
   partnerById: Map<number, PartnerInfo>;
   activePartnerUserId: number | null;
-  setActivePartnerUserId: (v: number | null | ((p: number | null) => number | null)) => void;
-  chatEnabled: boolean;
-  chatDisabledReason?: string;
-  onOpenNewChat: () => void;
+  onSelectPartner: (partnerId: number) => void;
+  contactsLoading: boolean;
+  contactsError: string | null;
+  onRefreshContacts: () => void;
 }) {
-  const sortedRooms = useMemo(() => {
-    return [...rooms]
-      .filter(([, ms]) => ms.size > 0)
-      .sort(
-        ([, a], [, b]) =>
-          Math.max(...[...b.values()].map((m) => Date.parse(m.createdAt))) -
-          Math.max(...[...a.values()].map((m) => Date.parse(m.createdAt))),
-      );
-  }, [rooms]);
+  const sortedPartners = useMemo(() => {
+    const rows = [...partnerById.values()];
+    return rows.sort((a, b) => {
+      const aRoom = rooms.get(a.id);
+      const bRoom = rooms.get(b.id);
+      const aHas = (aRoom?.size ?? 0) > 0;
+      const bHas = (bRoom?.size ?? 0) > 0;
+      if (aHas && bHas) {
+        const aT = Math.max(
+          ...[...aRoom!.values()].map((m) => Date.parse(m.createdAt)),
+        );
+        const bT = Math.max(
+          ...[...bRoom!.values()].map((m) => Date.parse(m.createdAt)),
+        );
+        return bT - aT;
+      }
+      if (aHas !== bHas) return aHas ? -1 : 1;
+      return (a.storeName ?? a.name).localeCompare(b.storeName ?? b.name, "id");
+    });
+  }, [partnerById, rooms]);
 
   return (
     <div
       className={`${activePartnerUserId != null ? "hidden md:flex" : "flex"} w-full flex-col overflow-hidden border-r border-[#E5E5E5] bg-white md:w-[320px]`}
     >
-      <div className="flex flex-row items-center justify-between border-b border-[#E5E5E5] p-4">
-        <h2 className="m-0 text-[1.125rem] font-semibold">
-          {userRole === "BUYER" ? "Toko" : "Pembeli"}
-        </h2>
-        <button
-          type="button"
-          onClick={onOpenNewChat}
-          disabled={!chatEnabled}
-          title={
-            !chatEnabled
-              ? (chatDisabledReason ?? "Chat tidak tersedia")
-              : undefined
-          }
-          className={`flex aspect-square items-center justify-center rounded-full p-2 transition-colors ${!chatEnabled ? "cursor-not-allowed opacity-50" : "text-[#42B549] hover:bg-[#f4fbf5]"}`}
-        >
-          <i className="bx bx-plus text-2xl" />
-        </button>
+      <div className="border-b border-[#E5E5E5] p-4">
+        <div className="flex flex-row items-center justify-between gap-2">
+          <h2 className="m-0 text-[1.125rem] font-semibold">users terdaftar</h2>
+          <button
+            type="button"
+            onClick={onRefreshContacts}
+            disabled={contactsLoading}
+            aria-label="Segarkan daftar user"
+            title="Segarkan daftar user"
+            className={`flex aspect-square shrink-0 items-center justify-center rounded-full p-2 transition-colors ${contactsLoading ? "cursor-wait opacity-60" : "text-[#42B549] hover:bg-[#f4fbf5]"}`}
+          >
+            <i
+              className={`bx bx-revision text-2xl ${contactsLoading ? "animate-spin" : ""}`}
+            />
+          </button>
+        </div>
+        {contactsError ? (
+          <div className="mt-3 border-l-4 border-red-500 bg-red-50 p-3 text-sm text-red-800">
+            {contactsError}
+          </div>
+        ) : null}
       </div>
       <div className="flex flex-1 flex-col overflow-y-auto">
-        {sortedRooms.length === 0 ? (
-          <div className="my-auto flex flex-col items-center p-8 text-center text-[#999]">
-            <i className="bx bx-message-square-dots mb-4 text-[3rem]" />
-            <p className="mb-2">Belum ada percakapan</p>
-            {!chatEnabled ? (
-              <div className="mt-2 border-l-4 border-yellow-500 bg-yellow-50 p-3">
-                <p className="text-sm text-yellow-800">
-                  {chatDisabledReason ?? "Chat tidak tersedia"}
-                </p>
-              </div>
-            ) : (
-              <button
-                type="button"
-                onClick={onOpenNewChat}
-                className="flex items-center gap-2 rounded-lg px-3 py-2 text-[#42B549] transition-colors hover:bg-[#f4fbf5]"
-              >
-                <i className="bx bx-plus text-xl" />
-                <span className="font-medium">Chat Baru</span>
-              </button>
-            )}
+        {contactsLoading ? (
+          <div className="flex flex-1 flex-col items-center justify-center p-8 text-sm text-[#666]">
+            Memuat daftar user…
+          </div>
+        ) : sortedPartners.length === 0 ? (
+          <div className="flex flex-1 flex-col items-center justify-center p-8 text-center text-[#999]">
+            <i className="bx bx-user-plus mb-4 text-[3rem]" />
+            <p className="m-0 text-sm">
+              Belum ada user lain (atau kamu user pertama).
+            </p>
           </div>
         ) : (
-          sortedRooms.map(([p, ms]) => {
-            const pi = partnerById.get(p);
-            const unreadCount = [...ms.values()].filter(
-              (m) => m.toUserId === userId && !m.isRead,
-            ).length;
-            const lastMessage = [...ms.values()].sort(
-              (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt),
-            )[0]!;
+          sortedPartners.map((pi) => {
+            const ms = rooms.get(pi.id);
+            const hasMessages = (ms?.size ?? 0) > 0;
+            const unreadCount = hasMessages
+              ? [...ms!.values()].filter(
+                  (m) => m.toUserId === userId && !m.isRead,
+                ).length
+              : 0;
+            const lastMessage = hasMessages
+              ? [...ms!.values()].sort(
+                  (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt),
+                )[0]!
+              : null;
 
             return (
               <button
                 type="button"
-                key={p}
-                onClick={() =>
-                  setActivePartnerUserId((v) => (v !== p ? p : null))
-                }
-                className={`w-full cursor-pointer border-b border-[#F0F0F0] p-4 text-left transition-colors ${activePartnerUserId === p ? "bg-[#F0FFF1]" : "bg-transparent"}`}
+                key={pi.id}
+                onClick={() => onSelectPartner(pi.id)}
+                className={`w-full cursor-pointer border-b border-[#F0F0F0] p-4 text-left transition-colors ${activePartnerUserId === pi.id ? "bg-[#F0FFF1]" : "bg-transparent"}`}
               >
                 <div className="flex items-center gap-3">
-                  <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[#E5E5E5] text-[1.5rem] text-[#42B549]">
-                    {pi?.storeLogoPath != null ? (
+                  <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-[#E5E5E5] text-[1.5rem] text-[#42B549]">
+                    {pi.storeLogoPath != null ? (
                       <img
                         src={pi.storeLogoPath}
                         alt=""
@@ -329,43 +179,49 @@ function ChatSidebar({
                     ) : (
                       <i
                         className={
-                          pi?.role === "SELLER" ? "bx bx-store" : "bx bx-user"
+                          pi.role === "SELLER" ? "bx bx-store" : "bx bx-user"
                         }
                       />
                     )}
                   </div>
                   <div className="min-w-0 flex-1">
-                    <div className="mb-1 flex items-center justify-between">
+                    <div className="mb-1 flex items-center justify-between gap-2">
                       <h3 className="m-0 max-w-[70%] overflow-hidden text-ellipsis whitespace-nowrap text-[0.9375rem] font-semibold">
-                        {pi == null
-                          ? "Unknown"
-                          : (pi.storeName ?? pi.name)}
+                        {pi.storeName ?? pi.name}
                       </h3>
-                      <span className="ml-2 shrink-0 text-[0.75rem] text-[#999]">
-                        {formatTime(Date.parse(lastMessage.createdAt))}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <p className="m-0 max-w-[85%] overflow-hidden text-ellipsis whitespace-nowrap text-[0.875rem]">
-                        <span className="text-[#666]">
-                          {lastMessage.fromUserId === userId ? (
-                            lastMessage.id == null ? (
-                              <i className="bx bx-time-five mr-1 inline align-middle text-[1rem]" />
-                            ) : lastMessage.isRead ? (
-                              <i className="bx bx-check-double mr-1 inline align-middle text-[1rem] text-[#0098ff]" />
-                            ) : (
-                              <i className="bx bx-check-double mr-1 inline align-middle text-[1rem]" />
-                            )
-                          ) : null}
-                          {lastMessage.messageType === "text"
-                            ? lastMessage.content.slice(0, 120)
-                            : lastMessage.messageType === "image"
-                              ? "🖼️ Gambar"
-                              : null}
+                      {lastMessage ? (
+                        <span className="ml-2 shrink-0 text-[0.75rem] text-[#999]">
+                          {formatTime(Date.parse(lastMessage.createdAt))}
                         </span>
+                      ) : null}
+                    </div>
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="m-0 max-w-[85%] overflow-hidden text-ellipsis whitespace-nowrap text-[0.875rem]">
+                        {lastMessage ? (
+                          <span className="text-[#666]">
+                            {lastMessage.fromUserId === userId ? (
+                              lastMessage.id == null ? (
+                                <i className="bx bx-time-five mr-1 inline align-middle text-[1rem]" />
+                              ) : lastMessage.isRead ? (
+                                <i className="bx bx-check-double mr-1 inline align-middle text-[1rem] text-[#0098ff]" />
+                              ) : (
+                                <i className="bx bx-check-double mr-1 inline align-middle text-[1rem]" />
+                              )
+                            ) : null}
+                            {lastMessage.messageType === "text"
+                              ? lastMessage.content.slice(0, 120)
+                              : lastMessage.messageType === "image"
+                                ? "🖼️ Gambar"
+                                : null}
+                          </span>
+                        ) : (
+                          <span className="text-[#999]">
+                            Ketuk untuk mulai chat
+                          </span>
+                        )}
                       </p>
                       {unreadCount > 0 ? (
-                        <span className="ml-2 min-w-5 rounded-xl bg-[#42B549] px-2 py-0.5 text-center text-[0.75rem] font-semibold text-white">
+                        <span className="ml-2 min-w-5 shrink-0 rounded-xl bg-[#42B549] px-2 py-0.5 text-center text-[0.75rem] font-semibold text-white">
                           {unreadCount}
                         </span>
                       ) : null}
@@ -571,83 +427,101 @@ function ChatDashboard({
 }
 
 export type ChatPageProps = {
+  token: string;
+  email: string;
   onLogout: () => void;
 };
 
-export function ChatPage({ onLogout }: ChatPageProps) {
-  const [rooms, setRooms] = useState(() => initialMessages());
-  const [activePartnerUserId, setActivePartnerUserId] = useState<number | null>(
-    2,
+export function ChatPage({ token, email, onLogout }: ChatPageProps) {
+  const [rooms, setRooms] = useState<Map<number, Map<number | string, Message>>>(
+    () => new Map(),
   );
-  const [showNewChatModal, setShowNewChatModal] = useState(false);
+  const [activePartnerUserId, setActivePartnerUserId] = useState<number | null>(
+    null,
+  );
+
+  const [contacts, setContacts] = useState<string[]>([]);
+  const [contactsError, setContactsError] = useState<string | null>(null);
+  const [contactsLoading, setContactsLoading] = useState(false);
+
+  const refreshContacts = () => {
+    setContactsLoading(true);
+    setContactsError(null);
+    fetchContacts(token)
+      .then((res) => setContacts((res.contacts ?? []).filter((c) => c !== email)))
+      .catch((err) => {
+        if (err instanceof ApiError) setContactsError(err.message);
+        else setContactsError("Gagal mengambil daftar user.");
+      })
+      .finally(() => setContactsLoading(false));
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setContactsLoading(true);
+      setContactsError(null);
+    });
+    fetchContacts(token)
+      .then((res) => {
+        if (cancelled) return;
+        const next = (res.contacts ?? []).filter((c) => c !== email);
+        setContacts(next);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        if (err instanceof ApiError) setContactsError(err.message);
+        else setContactsError("Gagal mengambil daftar user.");
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setContactsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, email]);
+
+  const partners = useMemo(() => {
+    return contacts.map((c, idx) => {
+      const id = idx + 1;
+      const p: PartnerInfo = {
+        id,
+        role: "USER",
+        name: c,
+        storeId: null,
+        storeName: null,
+        storeDescription: null,
+        storeLogoPath: null,
+      };
+      return p;
+    });
+  }, [contacts]);
 
   const partnerById = useMemo(() => {
     const m = new Map<number, PartnerInfo>();
-    for (const p of MOCK_PARTNERS) m.set(p.id, p);
+    for (const p of partners) m.set(p.id, p);
     return m;
-  }, []);
+  }, [partners]);
 
   const chatEnabled = true;
 
-  const ensureRoom = (partnerId: number) => {
+  const selectPartner = (partnerId: number) => {
+    setActivePartnerUserId((prev) => (prev === partnerId ? null : partnerId));
     setRooms((prev) => {
+      if (prev.has(partnerId)) return prev;
       const next = new Map(prev);
-      if (!next.has(partnerId)) next.set(partnerId, new Map());
+      next.set(partnerId, new Map());
       return next;
     });
-  };
-
-  const onPickNewChat = (partnerId: number) => {
-    ensureRoom(partnerId);
-    setActivePartnerUserId(partnerId);
   };
 
   const onSendText = (text: string) => {
+    // Message API isn’t connected yet; keep UI stable without dummy traffic.
+    // When backend endpoints exist, wire this to a real send + refetch/stream.
     if (activePartnerUserId == null) return;
-    const partnerId = activePartnerUserId;
-    const tracking = Math.floor(Math.random() * 65536);
-    const msg: Message = {
-      id: null,
-      fromUserId: MOCK_USER_ID,
-      toUserId: partnerId,
-      messageType: "text",
-      content: text,
-      tracking,
-      isRead: false,
-      createdAt: new Date().toISOString(),
-    };
-    setRooms((prev) => {
-      const next = new Map(prev);
-      let r = next.get(partnerId);
-      if (!r) {
-        r = new Map();
-        next.set(partnerId, r);
-      }
-      const r2 = new Map(r);
-      r2.set(tracking, msg);
-      next.set(partnerId, r2);
-      return next;
-    });
-    window.setTimeout(() => {
-      setRooms((prev) => {
-        const next = new Map(prev);
-        const r = next.get(partnerId);
-        if (!r) return prev;
-        const r2 = new Map(r);
-        const cur = r2.get(tracking);
-        if (!cur || cur.id != null) return prev;
-        const realId = Math.floor(Math.random() * 1_000_000) + 10_000;
-        const saved: Message = {
-          ...cur,
-          id: realId,
-          tracking: null,
-        };
-        r2.delete(tracking);
-        r2.set(realId, saved);
-        next.set(partnerId, r2);
-        return next;
-      });
-    }, 400);
+    void text;
   };
 
   const activePartner = activePartnerUserId
@@ -664,6 +538,9 @@ export function ChatPage({ onLogout }: ChatPageProps) {
         <h1 className="m-0 flex-1 text-[1.5rem] font-semibold text-[#333]">
           Chat
         </h1>
+        <div className="hidden text-sm text-[#666] md:block">
+          Login sebagai <span className="font-semibold text-[#333]">{email}</span>
+        </div>
         <button
           type="button"
           onClick={onLogout}
@@ -673,26 +550,18 @@ export function ChatPage({ onLogout }: ChatPageProps) {
         </button>
       </div>
       <div className="flex min-h-0 flex-1 overflow-hidden">
-        {showNewChatModal ? (
-          <NewChatModal
-            close={() => setShowNewChatModal(false)}
-            userRole={MOCK_USER_ROLE}
-            allPartners={MOCK_PARTNERS}
-            onPick={onPickNewChat}
-          />
-        ) : null}
         <ChatSidebar
-          userId={MOCK_USER_ID}
-          userRole={MOCK_USER_ROLE}
+          userId={0}
           rooms={rooms}
           partnerById={partnerById}
           activePartnerUserId={activePartnerUserId}
-          setActivePartnerUserId={setActivePartnerUserId}
-          chatEnabled={chatEnabled}
-          onOpenNewChat={() => setShowNewChatModal(true)}
+          onSelectPartner={selectPartner}
+          contactsLoading={contactsLoading}
+          contactsError={contactsError}
+          onRefreshContacts={refreshContacts}
         />
         <ChatDashboard
-          userId={MOCK_USER_ID}
+          userId={0}
           activePartnerUserId={activePartnerUserId}
           setActivePartnerUserId={setActivePartnerUserId}
           partnerInfo={activePartner}
