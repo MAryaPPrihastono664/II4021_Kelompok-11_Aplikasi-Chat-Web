@@ -14,7 +14,7 @@ from .auth import create_access_token, get_current_token_payload
 from .db import get_db
 from .models import Message, User
 from .utils import generate_salt, hash_password, verify_password
-from sqlalchemy import and_, select
+from sqlalchemy import and_, select, or_  # Tambahkan or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 _LOGIN_FAILED_DETAIL = "Invalid email or password"
@@ -60,9 +60,10 @@ async def register(request: RegisterRequest, db: AsyncSession = Depends(get_db))
     return {"ok": True}
 
 @app.post("/auth/login")
-async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
     res = await db.execute(select(User).where(User.email == str(request.email)))
     user = res.scalar_one_or_none()
+    
     if user is None:
         verify_password(request.password, _LOGIN_DUMMY_SALT, _LOGIN_DUMMY_HASH)
         raise HTTPException(status_code=401, detail=_LOGIN_FAILED_DETAIL)
@@ -71,7 +72,15 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)) -> To
         raise HTTPException(status_code=401, detail=_LOGIN_FAILED_DETAIL)
     
     token = create_access_token(subject=user.email)
-    return TokenResponse(token=token)
+    return {
+        "ok": True,
+        "token": token,
+        "user": {
+            "email": user.email,
+            "encrypted_private_key": user.encrypted_private_key,
+            "kdf_params": user.kdf_params # Ini akan otomatis jadi JSON object
+        }
+    }
 
 @app.post("/auth/logout")
 def logout(_: dict = Depends(get_current_token_payload)):
@@ -113,7 +122,12 @@ async def get_messages(
 
     res = await db.execute(
         select(Message)
-        .where(and_(Message.sender_email == me, Message.receiver_email == email))
+        .where(
+            or_(
+                and_(Message.sender_email == me, Message.receiver_email == email),
+                and_(Message.sender_email == email, Message.receiver_email == me)
+            )
+        )
         .order_by(Message.timestamp.asc())
     )
     messages = []

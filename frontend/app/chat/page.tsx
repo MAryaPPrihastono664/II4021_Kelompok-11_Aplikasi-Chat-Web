@@ -32,7 +32,9 @@ export default function ChatRoutePage() {
       token={auth.token}
       email={auth.email}
       onLogout={() => {
-        clearStoredAuth();
+        clearStoredAuth(); 
+        // Tambahkan baris ini untuk keamanan:
+        localStorage.removeItem("my_private_key"); 
         router.replace("/");
       }}
     />

@@ -3,6 +3,8 @@
 import { useState, type FormEvent } from "react";
 import { ApiError, login, register } from "@/lib/api";
 
+import { generateChatKeyPair, encryptPrivateKey, decryptPrivateKey } from "@/lib/crypto";
+
 type Tab = "login" | "register";
 
 type AuthCardProps = {
@@ -29,44 +31,95 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
   const [registerPassword, setRegisterPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-
+  
   const onLoginSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setSubmitting(true);
     setFormError(null);
     try {
+      // 1. Panggil API Login
       const res = await login(loginEmail.trim(), loginPassword);
+      
+      // 2. Ambil data enkripsi kunci dari response (Pastikan API login Anda mengembalikan ini)
+      // Jika res.user tidak ada, Anda mungkin perlu menyesuaikan schema API di backend
+      if (res.user && res.user.encrypted_private_key) {
+        try {
+          const { encrypted_private_key, kdf_params } = res.user;
+          
+          // 3. Dekripsi Private Key menggunakan password login
+          const decryptedPrivKey = await decryptPrivateKey(
+            encrypted_private_key,
+            loginPassword,
+            kdf_params.iv,
+            kdf_params.salt,
+            kdf_params.iterations
+          );
+
+          // 4. Simpan hasil dekripsi ke localStorage agar bisa dipakai chat-page.tsx
+          localStorage.setItem("my_private_key", decryptedPrivKey);
+        } catch (decryptErr) {
+          console.error("Gagal dekripsi private key:", decryptErr);
+          // Jika dekripsi gagal, user tidak akan bisa baca/kirim pesan
+        }
+      }
+
       onAuthenticated?.({ token: res.token, email: loginEmail.trim() });
     } catch (err) {
-      if (err instanceof ApiError) setFormError(err.message);
-      else setFormError("Gagal masuk. Coba lagi.");
+      setFormError("Email atau password salah.");
     } finally {
       setSubmitting(false);
     }
   };
 
   const onRegisterSubmit = async (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    setSubmitting(true);
-    setFormError(null);
-    try {
-      const email = registerEmail.trim();
-      await register({
-        email,
-        password: registerPassword,
-        public_key: "placeholder-public-key",
-        encrypted_private_key: "placeholder-encrypted-private-key",
-        kdf_params: { note: "placeholder" },
-      });
-      const res = await login(email, registerPassword);
-      onAuthenticated?.({ token: res.token, email });
-    } catch (err) {
-      if (err instanceof ApiError) setFormError(err.message);
-      else setFormError("Gagal daftar. Coba lagi.");
-    } finally {
-      setSubmitting(false);
-    }
-  };
+  e.preventDefault();
+  setSubmitting(true);
+  setFormError(null);
+  
+  try {
+    const email = registerEmail.trim();
+    const password = registerPassword;
+
+    // A. Generate Kunci Komunikasi (ECDH)
+    const keyPair = await generateChatKeyPair();
+    
+    // B. Export ke format JWK (untuk dikirim/disimpan)
+    const pubKeyJWK = await window.crypto.subtle.exportKey("jwk", keyPair.publicKey);
+    const privKeyJWK = await window.crypto.subtle.exportKey("jwk", keyPair.privateKey);
+    const privKeyString = JSON.stringify(privKeyJWK);
+
+    // C. Enkripsi Private Key dengan Password
+    const encryptedData = await encryptPrivateKey(privKeyString, password);
+
+    // D. Kirim ke Backend
+    await register({
+      email,
+      password,
+      public_key: JSON.stringify(pubKeyJWK),
+      encrypted_private_key: encryptedData.ciphertext,
+      kdf_params: {
+        iv: encryptedData.iv,
+        salt: encryptedData.salt,
+        iterations: encryptedData.iterations
+      },
+    });
+
+    // E. Login otomatis
+    const res = await login(email, password);
+
+    // F. SIMPAN PRIVATE KEY KE LOCALSTORAGE (PENTING!)
+    // Simpan dalam keadaan plain (atau simpan password di memory) agar ChatPage bisa pakai
+    localStorage.setItem("my_private_key", privKeyString);
+
+    onAuthenticated?.({ token: res.token, email });
+  } catch (err: any) {
+    console.error(err);
+    if (err instanceof ApiError) setFormError(err.message);
+    else setFormError("Gagal daftar. Pastikan server berjalan.");
+  } finally {
+    setSubmitting(false);
+  }
+};
 
   return (
     <div className="auth-card-container min-h-[400px] w-full max-w-xl rounded-2xl border border-gray-200 bg-white p-10 shadow-[0_4px_16px_rgba(0,0,0,0.1)]">
