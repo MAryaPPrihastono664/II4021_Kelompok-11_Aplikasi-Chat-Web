@@ -1,17 +1,38 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { ApiError, fetchContacts, fetchPublicKey, sendMessage, fetchMessages } from "@/lib/api";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { ApiError, fetchContacts, fetchPublicKey, fetchMessages } from "@/lib/api";
 
 type Message = {
-  id: number | null;
+  id: string | number | null;
   fromUserId: number;
   toUserId: number;
-  messageType: "text" | "image";
   content: string;
-  tracking: number | null;
+  tracking?: number | null;
   isRead: boolean;
   createdAt: string;
+  ciphertext?: string;
+  iv?: string;
+};
+
+type ApiMessage = {
+  id: string;
+  sender_email: string;
+  receiver_email: string;
+  ciphertext: string;
+  iv: string;
+  timestamp: string;
+};
+
+type WsIncomingMessage = {
+  type: "new_message";
+  message: ApiMessage;
 };
 
 export type PartnerInfo = {
@@ -24,25 +45,78 @@ export type PartnerInfo = {
   storeLogoPath: string | null;
 };
 
-// Utilitas untuk konversi format data
 const hexToBuffer = (hex: string) => new Uint8Array(hex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
 const bufferToHex = (buf: ArrayBuffer) => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 
-// Fungsi untuk derivasi kunci simetris (ECDH + HKDF)
-async function deriveSharedKey(myPrivateKeyJWK: any, partnerPublicKeyJWK: any) {
-  const privateKey = await window.crypto.subtle.importKey(
-    "jwk", myPrivateKeyJWK, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveKey"]
-  );
-  const publicKey = await window.crypto.subtle.importKey(
-    "jwk", partnerPublicKeyJWK, { name: "ECDH", namedCurve: "P-256" }, false, []
-  );
+function utf8Bytes(v: string) {
+  return new TextEncoder().encode(v);
+}
 
-  return window.crypto.subtle.deriveKey(
+function websocketBaseUrl() {
+  const base = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+  const normalized = base.replace(/\/+$/, "");
+  if (normalized.startsWith("https://")) {
+    return normalized.replace("https://", "wss://");
+  }
+  if (normalized.startsWith("http://")) {
+    return normalized.replace("http://", "ws://");
+  }
+  return normalized;
+}
+
+async function deriveConversationAesKey(
+  myPrivateKeyJWK: JsonWebKey,
+  partnerPublicKeyJWK: JsonWebKey,
+  myEmail: string,
+  partnerEmail: string,
+) {
+  const { key_ops: _privKeyOps, ...privateJwkClean } = myPrivateKeyJWK;
+  void _privKeyOps;
+  const privateKey = await window.crypto.subtle.importKey(
+    "jwk",
+    privateJwkClean,
+    { name: "ECDH", namedCurve: "P-256" },
+    false,
+    ["deriveBits"],
+  );
+  const { key_ops: _pubKeyOps, ...publicJwkClean } = partnerPublicKeyJWK;
+  void _pubKeyOps;
+  const publicKey = await window.crypto.subtle.importKey(
+    "jwk",
+    publicJwkClean,
+    { name: "ECDH", namedCurve: "P-256" },
+    false,
+    [],
+  );
+  const sharedSecret = await window.crypto.subtle.deriveBits(
     { name: "ECDH", public: publicKey },
     privateKey,
+    256,
+  );
+
+  const hkdfBaseKey = await window.crypto.subtle.importKey(
+    "raw",
+    sharedSecret,
+    "HKDF",
+    false,
+    ["deriveKey"],
+  );
+  const info = utf8Bytes(
+    `chat:${[myEmail, partnerEmail].sort().join("|")}:aes-256-gcm`,
+  );
+  const salt = utf8Bytes("chat-webapp-hkdf-salt-v1");
+
+  return window.crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt,
+      info,
+    },
+    hkdfBaseKey,
     { name: "AES-GCM", length: 256 },
     false,
-    ["encrypt", "decrypt"]
+    ["encrypt", "decrypt"],
   );
 }
 
@@ -61,37 +135,7 @@ function formatTime(timestamp: number) {
   });
 }
 
-function RenderChatMessageText({ content }: { content: string }) {
-  const urlRe =
-    /\b(https?:\/\/[^\s]+\b|[a-z0-9-]+\.[a-z]{2,}\/[^\s]*)\b/gi;
-  const parts: ReactNode[] = [];
-  let last = 0;
-  let k = 0;
-  for (const m of content.matchAll(urlRe)) {
-    const i = m.index ?? 0;
-    if (i > last) parts.push(content.slice(last, i));
-    const raw = m[0];
-    let href = raw;
-    if (!/^https?:\/\//i.test(href)) href = `https://${href}`;
-    parts.push(
-      <a
-        key={k++}
-        href={href}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="text-blue-800 underline"
-      >
-        {raw}
-      </a>,
-    );
-    last = i + raw.length;
-  }
-  if (last < content.length) parts.push(content.slice(last));
-  return <>{parts.length ? parts : content}</>;
-}
-
 function ChatSidebar({
-  userId,
   rooms,
   partnerById,
   activePartnerUserId,
@@ -99,8 +143,8 @@ function ChatSidebar({
   contactsLoading,
   contactsError,
   onRefreshContacts,
+  messagePlaintext,
 }: {
-  userId: number;
   rooms: Map<number, Map<number | string, Message>>;
   partnerById: Map<number, PartnerInfo>;
   activePartnerUserId: number | null;
@@ -108,6 +152,7 @@ function ChatSidebar({
   contactsLoading: boolean;
   contactsError: string | null;
   onRefreshContacts: () => void;
+  messagePlaintext: Record<string, string>;
 }) {
   const sortedPartners = useMemo(() => {
     const rows = [...partnerById.values()];
@@ -173,9 +218,7 @@ function ChatSidebar({
             const ms = rooms.get(pi.id);
             const hasMessages = (ms?.size ?? 0) > 0;
             const unreadCount = hasMessages
-              ? [...ms!.values()].filter(
-                  (m) => m.toUserId === userId && !m.isRead,
-                ).length
+              ? [...ms!.values()].filter((m) => m.toUserId === 0 && !m.isRead).length
               : 0;
             const lastMessage = hasMessages
               ? [...ms!.values()].sort(
@@ -221,20 +264,16 @@ function ChatSidebar({
                       <p className="m-0 max-w-[85%] overflow-hidden text-ellipsis whitespace-nowrap text-[0.875rem]">
                         {lastMessage ? (
                           <span className="text-[#666]">
-                            {lastMessage.fromUserId === userId ? (
-                              lastMessage.id == null ? (
-                                <i className="bx bx-time-five mr-1 inline align-middle text-[1rem]" />
-                              ) : lastMessage.isRead ? (
-                                <i className="bx bx-check-double mr-1 inline align-middle text-[1rem] text-[#0098ff]" />
-                              ) : (
-                                <i className="bx bx-check-double mr-1 inline align-middle text-[1rem]" />
-                              )
-                            ) : null}
-                            {lastMessage.messageType === "text"
-                              ? lastMessage.content.slice(0, 120)
-                              : lastMessage.messageType === "image"
-                                ? "🖼️ Gambar"
-                                : null}
+                            {(() => {
+                              const k = String(
+                                lastMessage.id ?? `t-${lastMessage.tracking}`,
+                              );
+                              const plain =
+                                messagePlaintext[k] ?? lastMessage.content;
+                              return plain
+                                ? plain.slice(0, 120)
+                                : "Mendekripsi…";
+                            })()}
                           </span>
                         ) : (
                           <span className="text-[#999]">
@@ -262,32 +301,13 @@ function ChatSidebar({
 async function decryptMessage(
   ciphertextHex: string,
   ivHex: string,
-  myPrivateKeyJWK: any,
-  partnerPublicKeyJWK: any
+  aesKey: CryptoKey,
 ): Promise<string> {
   try {
-    // 1. Import Kunci
-    const privKey = await window.crypto.subtle.importKey(
-      "jwk", myPrivateKeyJWK, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveKey"]
-    );
-    const pubKey = await window.crypto.subtle.importKey(
-      "jwk", partnerPublicKeyJWK, { name: "ECDH", namedCurve: "P-256" }, false, []
-    );
-
-    // 2. Derivasi Kunci AES-GCM (ECDH + HKDF internal deriveKey)
-    const sharedKey = await window.crypto.subtle.deriveKey(
-      { name: "ECDH", public: pubKey },
-      privKey,
-      { name: "AES-GCM", length: 256 },
-      false,
-      ["decrypt"]
-    );
-
-    // 3. Dekripsi
     const decryptedBuffer = await window.crypto.subtle.decrypt(
       { name: "AES-GCM", iv: hexToBuffer(ivHex) },
-      sharedKey,
-      hexToBuffer(ciphertextHex)
+      aesKey,
+      hexToBuffer(ciphertextHex),
     );
 
     return new TextDecoder().decode(decryptedBuffer);
@@ -297,8 +317,6 @@ async function decryptMessage(
   }
 }
 
-// --- Komponen Utama ---
-
 function ChatDashboard({
   userId,
   activePartnerUserId,
@@ -306,89 +324,21 @@ function ChatDashboard({
   partnerInfo,
   room,
   chatEnabled,
-  chatDisabledReason,
-  sendError, // Ambil dari props
+  sendError,
   onSendText,
+  messagePlaintext,
 }: {
   userId: number;
   activePartnerUserId: number | null;
   setActivePartnerUserId: (v: number | null) => void;
-  partnerInfo: any; // Sesuaikan dengan tipe PartnerInfo Anda
-  room: Map<number | string, any>; // Message type
+  partnerInfo: PartnerInfo | null;
+  room: Map<number | string, Message>;
   chatEnabled: boolean;
-  chatDisabledReason?: string;
   sendError: string | null;
   onSendText: (text: string) => void;
+  messagePlaintext: Record<string, string>;
 }) {
   const [inputMessage, setInputMessage] = useState("");
-  
-  // State untuk menyimpan pesan yang sudah didekripsi
-  const [decryptedMessages, setDecryptedMessages] = useState<Record<string, string>>({});
-
-  // Ambil kunci privat user dari storage (asumsi disimpan dalam format JWK)
-  const myPrivateKeyJWK = useMemo(() => {
-    // PASTIKAN KEY-NYA "my_private_key" (sesuai dengan yang di-set saat login)
-    const stored = localStorage.getItem("my_private_key"); 
-    if (!stored) {
-      console.error("Kunci privat tidak ditemukan di localStorage");
-      return null;
-    }
-    try {
-      return JSON.parse(stored);
-    } catch (e) {
-      console.error("Format kunci di localStorage bukan JSON yang valid", e);
-      return null;
-    }
-  }, []);
-
-  // Ambil kunci publik partner dari partnerInfo
-  // Di dalam ChatDashboard
-const partnerPublicKeyJWK = useMemo(() => {
-  if (!partnerInfo?.public_key) return null;
-  
-  const rawKey = partnerInfo.public_key;
-  try {
-    // Jika string, parse. Jika sudah objek, langsung ambil.
-    return typeof rawKey === 'string' ? JSON.parse(rawKey) : rawKey;
-  } catch (e) {
-    console.error("Gagal parse partner public key", e);
-    return null;
-  }
-}, [partnerInfo]);
-
-  // Efek untuk memproses dekripsi setiap kali ada pesan baru
-  // Di dalam function ChatDashboard
-  useEffect(() => {
-    const processRoom = async () => {
-      // JANGAN LANJUT jika kunci belum ada
-      if (!myPrivateKeyJWK || !partnerPublicKeyJWK) return;
-
-      const newDecrypted: Record<string, string> = { ...decryptedMessages };
-      let changed = false;
-
-      for (const m of room.values()) {
-        const msgId = m.id ?? `t-${m.tracking}`;
-        
-        // Dekripsi jika belum ada di cache ATAU jika sebelumnya error (mengandung "[Error")
-        const needsDecryption = !newDecrypted[msgId] || newDecrypted[msgId].includes("[Error");
-
-        if (needsDecryption && m.ciphertext && m.messageType === "text") {
-          newDecrypted[msgId] = await decryptMessage(
-            m.ciphertext,
-            m.iv,
-            myPrivateKeyJWK,
-            partnerPublicKeyJWK
-          );
-          changed = true;
-        }
-      }
-
-      if (changed) setDecryptedMessages(newDecrypted);
-    };
-
-    processRoom();
-    // Tambahkan partnerPublicKeyJWK sebagai dependency
-  }, [room, myPrivateKeyJWK, partnerPublicKeyJWK]);
 
   const sorted = useMemo(
     () =>
@@ -421,7 +371,11 @@ const partnerPublicKeyJWK = useMemo(() => {
         </button>
         <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#E5E5E5] text-[1.25rem] text-[#42B549]">
           {partnerInfo.storeLogoPath != null ? (
-            <img src={partnerInfo.storeLogoPath} className="h-full w-full rounded-full border object-cover" />
+            <img
+              src={partnerInfo.storeLogoPath}
+              alt=""
+              className="h-full w-full rounded-full border object-cover"
+            />
           ) : (
             <i className={partnerInfo.role === "SELLER" ? "bx bx-store" : "bx bx-user"} />
           )}
@@ -438,8 +392,8 @@ const partnerPublicKeyJWK = useMemo(() => {
           </div>
         ) : (
           sorted.map((m) => {
-            const msgId = m.id ?? `t-${m.tracking}`;
-            const displayContent = decryptedMessages[msgId] || "Mendekripsi...";
+            const msgId = String(m.id ?? `t-${m.tracking}`);
+            const displayContent = messagePlaintext[msgId] || "Mendekripsi...";
 
             return (
               <div
@@ -451,20 +405,14 @@ const partnerPublicKeyJWK = useMemo(() => {
                     m.fromUserId === userId ? "items-end bg-[#D9FDD3]" : "bg-white"
                   }`}
                 >
-                  {m.messageType === "text" ? (
-                    <p className="hyphens-auto m-0 wrap-break-word text-[0.9375rem] [word-break:break-word]">
-                       {/* Gunakan displayContent yang sudah didekripsi */}
-                      <RenderChatMessageText content={displayContent} />
-                    </p>
-                  ) : (
-                    <span className="text-sm text-[#666]">[Gambar]</span>
-                  )}
+                  <p className="hyphens-auto m-0 wrap-break-word text-[0.9375rem] [word-break:break-word]">
+                    {displayContent}
+                  </p>
                   
-                  <div className={`mt-1 flex items-center gap-1 text-[0.75rem] text-[#666666] ${m.fromUserId === userId ? "flex-row" : "flex-row-reverse"}`}>
+                  <div
+                    className={`mt-1 flex items-center gap-1 text-[0.75rem] text-[#666666] ${m.fromUserId === userId ? "flex-row" : "flex-row-reverse"}`}
+                  >
                     <span>{formatTime(Date.parse(m.createdAt))}</span>
-                    {m.fromUserId === userId && (
-                       <i className={`bx ${!m.id ? "bx-time-five" : m.isRead ? "bx-check-double text-[#0098ff]" : "bx-check-double"} text-[1rem]`} />
-                    )}
                   </div>
                 </div>
               </div>
@@ -514,10 +462,17 @@ const partnerPublicKeyJWK = useMemo(() => {
 export type ChatPageProps = {
   token: string;
   email: string;
+  myPrivateKeyJwk: JsonWebKey;
   onLogout: () => void;
 };
 
-export function ChatPage({ token, email, onLogout }: ChatPageProps) {
+export function ChatPage({
+  token,
+  email,
+  myPrivateKeyJwk,
+  onLogout,
+}: ChatPageProps) {
+  const wsRef = useRef<WebSocket | null>(null);
   const [rooms, setRooms] = useState<Map<number, Map<number | string, Message>>>(
     () => new Map(),
   );
@@ -525,17 +480,21 @@ export function ChatPage({ token, email, onLogout }: ChatPageProps) {
     null,
   );
 
-  // State tambahan untuk error pengiriman (karena diakses oleh ChatDashboard)
   const [sendError, setSendError] = useState<string | null>(null);
 
   const [contacts, setContacts] = useState<string[]>([]);
   const [contactsError, setContactsError] = useState<string | null>(null);
   const [contactsLoading, setContactsLoading] = useState(false);
-  // Di dalam function ChatPage
-  const [partnerKeys, setPartnerKeys] = useState<Map<number, any>>(new Map());
-
-  
-
+  const [wsConnected, setWsConnected] = useState(false);
+  const [partnerKeysByEmail, setPartnerKeysByEmail] = useState<
+    Map<string, JsonWebKey>
+  >(new Map());
+  const [aesKeysByEmail, setAesKeysByEmail] = useState<Map<string, CryptoKey>>(
+    new Map(),
+  );
+  const [messagePlaintext, setMessagePlaintext] = useState<
+    Record<string, string>
+  >({});
 
   const refreshContacts = () => {
     setContactsLoading(true);
@@ -594,11 +553,40 @@ export function ChatPage({ token, email, onLogout }: ChatPageProps) {
     });
   }, [contacts]);
 
+  const partnerIdByEmail = useMemo(() => {
+    const map = new Map<string, number>();
+    partners.forEach((partner) => map.set(partner.name, partner.id));
+    return map;
+  }, [partners]);
+
   const partnerById = useMemo(() => {
     const m = new Map<number, PartnerInfo>();
     for (const p of partners) m.set(p.id, p);
     return m;
   }, [partners]);
+
+  const upsertIncomingMessage = useCallback((m: ApiMessage) => {
+    const partnerEmail = m.sender_email === email ? m.receiver_email : m.sender_email;
+    const partnerId = partnerIdByEmail.get(partnerEmail);
+    if (!partnerId) return;
+
+    setRooms((prev) => {
+      const next = new Map(prev);
+      const roomMap = new Map(next.get(partnerId) ?? new Map<number | string, Message>());
+      roomMap.set(m.id, {
+        id: m.id,
+        fromUserId: m.sender_email === email ? 0 : partnerId,
+        toUserId: m.receiver_email === email ? 0 : partnerId,
+        content: "",
+        ciphertext: m.ciphertext,
+        iv: m.iv,
+        createdAt: m.timestamp,
+        isRead: true,
+      });
+      next.set(partnerId, roomMap);
+      return next;
+    });
+  }, [email, partnerIdByEmail]);
 
   const activePartner = activePartnerUserId
     ? partnerById.get(activePartnerUserId)
@@ -610,6 +598,45 @@ export function ChatPage({ token, email, onLogout }: ChatPageProps) {
 
   const chatEnabled = true;
 
+  useEffect(() => {
+    const ws = new WebSocket(
+      `${websocketBaseUrl()}/ws/messages?token=${encodeURIComponent(token)}`,
+    );
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setWsConnected(true);
+    };
+
+    ws.onclose = () => {
+      setWsConnected(false);
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
+    };
+
+    ws.onerror = () => {
+      setWsConnected(false);
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const parsed = JSON.parse(event.data) as WsIncomingMessage;
+        if (parsed?.type !== "new_message" || !parsed.message) return;
+        upsertIncomingMessage(parsed.message);
+      } catch (err) {
+        console.error("Pesan websocket tidak valid:", err);
+      }
+    };
+
+    return () => {
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
+      ws.close();
+    };
+  }, [token, upsertIncomingMessage]);
+
   const selectPartner = (partnerId: number) => {
     setActivePartnerUserId((prev) => (prev === partnerId ? null : partnerId));
     setRooms((prev) => {
@@ -620,127 +647,169 @@ export function ChatPage({ token, email, onLogout }: ChatPageProps) {
     });
   };
 
-// Fungsi Refresh Pesan
-  const refreshMessages = async () => {
-  if (!activePartner || !activePartnerUserId) return;
-  try {
-    // 1. AMBIL KUNCI PUBLIK jika belum tersedia di state
-    if (!partnerKeys.has(activePartnerUserId)) {
-      const keyData = await fetchPublicKey(activePartner.name, token);
-      let pubKey = typeof keyData.public_key === 'string' 
-        ? JSON.parse(keyData.public_key) 
-        : keyData.public_key;
-      
-      setPartnerKeys(prev => new Map(prev).set(activePartnerUserId, pubKey));
+  const parsePublicKeyJwk = useCallback((rawKey: unknown): JsonWebKey => {
+    if (typeof rawKey === "string") {
+      return JSON.parse(rawKey) as JsonWebKey;
+    }
+    return rawKey as JsonWebKey;
+  }, []);
+
+  const ensureAesKeyForPartner = useCallback(async (partnerEmail: string) => {
+    let partnerPublicKey = partnerKeysByEmail.get(partnerEmail) ?? null;
+    if (!partnerPublicKey) {
+      const keyData = await fetchPublicKey(partnerEmail, token);
+      partnerPublicKey = parsePublicKeyJwk(keyData.public_key);
+      setPartnerKeysByEmail((prev) => {
+        const next = new Map(prev);
+        next.set(partnerEmail, partnerPublicKey!);
+        return next;
+      });
     }
 
-    // 2. AMBIL PESAN
-    const data = await fetchMessages(activePartner.name, token);
-    setRooms((prev) => {
-      const next = new Map(prev);
-      const partnerMsgs = new Map();
-      data.messages.forEach((m: any) => {
-        partnerMsgs.set(m.id, {
-          id: m.id,
-          fromUserId: m.sender_email === email ? 0 : activePartnerUserId,
-          toUserId: m.receiver_email === email ? 0 : activePartnerUserId,
-          messageType: "text",
-          content: "", 
-          ciphertext: m.ciphertext,
-          iv: m.iv,
-          createdAt: m.timestamp,
-          isRead: true
-        });
+    let aesKey = aesKeysByEmail.get(partnerEmail) ?? null;
+    if (!aesKey) {
+      aesKey = await deriveConversationAesKey(
+        myPrivateKeyJwk,
+        partnerPublicKey,
+        email,
+        partnerEmail,
+      );
+      setAesKeysByEmail((prev) => {
+        const next = new Map(prev);
+        next.set(partnerEmail, aesKey!);
+        return next;
       });
-      next.set(activePartnerUserId, partnerMsgs);
-      return next;
-    });
-  } catch (err) {
-    console.error("Gagal refresh pesan:", err);
-  }
-};
+    }
+    if (!aesKey) {
+      throw new Error("Gagal membentuk kunci chat.");
+    }
+    return aesKey;
+  }, [
+    aesKeysByEmail,
+    email,
+    myPrivateKeyJwk,
+    parsePublicKeyJwk,
+    partnerKeysByEmail,
+    token,
+  ]);
 
-  // Efek untuk auto-refresh pesan saat ganti partner
   useEffect(() => {
-    if (activePartnerUserId) refreshMessages();
-  }, [activePartnerUserId]);
+    let cancelled = false;
+    (async () => {
+      const toMerge: Record<string, string> = {};
+      for (const [partnerId, roomMap] of rooms) {
+        const partner = partnerById.get(partnerId);
+        if (!partner) continue;
+        let aesKey = aesKeysByEmail.get(partner.name) ?? null;
+        if (!aesKey) {
+          try {
+            aesKey = await ensureAesKeyForPartner(partner.name);
+          } catch {
+            continue;
+          }
+        }
+        if (!aesKey) continue;
+        for (const m of roomMap.values()) {
+          if (!m.ciphertext || !m.iv) continue;
+          const msgKey = String(m.id ?? `t-${m.tracking}`);
+          toMerge[msgKey] = await decryptMessage(
+            m.ciphertext,
+            m.iv,
+            aesKey,
+          );
+        }
+      }
+      if (cancelled) return;
+      setMessagePlaintext((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const [k, v] of Object.entries(toMerge)) {
+          if (next[k] !== v) {
+            next[k] = v;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [rooms, aesKeysByEmail, partnerById, ensureAesKeyForPartner]);
 
-  const onSendText = async (text: string) => {
-  if (activePartnerUserId == null || !activePartner) return;
-    setSendError(null); // Reset error setiap kali mencoba kirim
+  const refreshMessages = useCallback(async () => {
+    if (!activePartner || !activePartnerUserId) return;
+    try {
+      await ensureAesKeyForPartner(activePartner.name);
+      const data = await fetchMessages(activePartner.name, token);
+      setRooms((prev) => {
+        const next = new Map(prev);
+        const partnerMsgs = new Map<number | string, Message>();
+        (data.messages as ApiMessage[]).forEach((m) => {
+          partnerMsgs.set(m.id, {
+            id: m.id,
+            fromUserId: m.sender_email === email ? 0 : activePartnerUserId,
+            toUserId: m.receiver_email === email ? 0 : activePartnerUserId,
+            content: "",
+            ciphertext: m.ciphertext,
+            iv: m.iv,
+            createdAt: m.timestamp,
+            isRead: true,
+          });
+        });
+        next.set(activePartnerUserId, partnerMsgs);
+        return next;
+      });
+    } catch (err) {
+      console.error("Gagal refresh pesan:", err);
+    }
+  }, [activePartner, activePartnerUserId, email, ensureAesKeyForPartner, token]);
+
+  useEffect(() => {
+    if (!activePartnerUserId) return;
+    const t = setTimeout(() => {
+      void refreshMessages();
+    }, 0);
+    return () => clearTimeout(t);
+  }, [activePartnerUserId, refreshMessages]);
+
+  const onSendText = useCallback(async (text: string) => {
+    if (activePartnerUserId == null || !activePartner) return;
+    setSendError(null);
 
     try {
-      // 1. Ambil Public Key Penerima
-      const partnerData = await fetchPublicKey(activePartner.name, token); 
-      let partnerPubKey;
-      if (typeof partnerData.public_key === 'string') {
-          try {
-              // Cek apakah string ini benar-benar JSON (diawali { )
-              if (partnerData.public_key.startsWith('{')) {
-                  partnerPubKey = JSON.parse(partnerData.public_key);
-              } else {
-                  // Jika bukan JSON (mungkin raw base64), Anda butuh logika import yang berbeda
-                  throw new Error("Public key bukan format JSON/JWK");
-              }
-          } catch (e) {
-              console.error("Gagal parse public key:", e);
-          }
-      } else {
-          // Jika sudah berupa objek, langsung gunakan
-          partnerPubKey = partnerData.public_key;
-      }      
-      // 2. Ambil Private Key milik sendiri (sudah didekripsi saat login)
-      const storedPriv = localStorage.getItem("my_private_key"); // Gunakan key yang konsisten
-      if (!storedPriv) throw new Error("Kunci privat tidak ditemukan. Silakan login ulang.");
-      const myPrivateKey = JSON.parse(storedPriv);
+      const aesKey = await ensureAesKeyForPartner(activePartner.name);
 
-      // 3. Derivasi Kunci
-      const sharedKey = await deriveSharedKey(myPrivateKey, partnerPubKey);
-
-      // 4. Enkripsi
       const iv = window.crypto.getRandomValues(new Uint8Array(12));
       const encodedContent = new TextEncoder().encode(text);
       const ciphertext = await window.crypto.subtle.encrypt(
         { name: "AES-GCM", iv },
-        sharedKey,
-        encodedContent
+        aesKey,
+        encodedContent,
       );
 
-      // 5. Kirim
-      await sendMessage(token, {
-        receiver_email: activePartner.name,
-        ciphertext: bufferToHex(ciphertext),
-        iv: bufferToHex(iv.buffer)
-      });
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        throw new Error("Koneksi realtime terputus. Coba beberapa detik lagi.");
+      }
 
-      // 6. Refresh
-      refreshMessages(); 
-    } catch (err: any) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: "send_message",
+          receiver_email: activePartner.name,
+          ciphertext: bufferToHex(ciphertext),
+          iv: bufferToHex(iv.buffer),
+        }),
+      );
+    } catch (err: unknown) {
       console.error("Gagal mengirim pesan:", err);
-      // Isi state error agar bisa ditampilkan di dashboard
-      setSendError(err.message || "Gagal mengenkripsi atau mengirim pesan.");
+      setSendError(
+        err instanceof Error
+          ? err.message
+          : "Gagal mengenkripsi atau mengirim pesan.",
+      );
     }
-  };
+  }, [activePartner, activePartnerUserId, ensureAesKeyForPartner]);
 
-    // Efek untuk auto-refresh pesan setiap 3 detik
-  useEffect(() => {
-    // Hanya jalankan interval jika ada chat yang sedang dibuka
-    if (!activePartnerUserId || !activePartner) return;
-
-    // Jalankan refresh pertama kali saat partner dipilih (sudah dihandle effect lain, tapi aman)
-    // refreshMessages(); 
-
-    const interval = setInterval(() => {
-      console.log("Auto-refreshing messages...");
-      refreshMessages();
-    }, 3000); // 3000ms = 3 detik
-
-    // Cleanup function: Penting agar interval berhenti saat ganti user atau logout
-    return () => {
-      clearInterval(interval);
-    };
-  }, [activePartnerUserId, activePartner, token]); // Trigger ulang jika partner atau token berubah
-  
   return (
     <div className="flex h-screen flex-col bg-[#F5F5F5]">
       <div className="flex items-center gap-4 border-b border-[#E5E5E5] bg-white px-6 py-4">
@@ -750,6 +819,15 @@ export function ChatPage({ token, email, onLogout }: ChatPageProps) {
         <div className="hidden text-sm text-[#666] md:block">
           Login sebagai <span className="font-semibold text-[#333]">{email}</span>
         </div>
+        <span
+          className={`rounded-full px-3 py-1 text-xs font-semibold ${
+            wsConnected
+              ? "bg-[#EAF8EC] text-[#1F7A2A]"
+              : "bg-[#FDECEC] text-[#B42318]"
+          }`}
+        >
+          {wsConnected ? "Realtime terhubung" : "Realtime terputus"}
+        </span>
         <button
           type="button"
           onClick={onLogout}
@@ -760,7 +838,6 @@ export function ChatPage({ token, email, onLogout }: ChatPageProps) {
       </div>
       <div className="flex min-h-0 flex-1 overflow-hidden">
         <ChatSidebar
-          userId={0}
           rooms={rooms}
           partnerById={partnerById}
           activePartnerUserId={activePartnerUserId}
@@ -768,19 +845,18 @@ export function ChatPage({ token, email, onLogout }: ChatPageProps) {
           contactsLoading={contactsLoading}
           contactsError={contactsError}
           onRefreshContacts={refreshContacts}
+          messagePlaintext={messagePlaintext}
         />
         <ChatDashboard
           userId={0}
           activePartnerUserId={activePartnerUserId}
           setActivePartnerUserId={setActivePartnerUserId}
-          partnerInfo={activePartner ? {
-            ...activePartner,
-            public_key: partnerKeys.get(activePartnerUserId!) 
-          } : null}
+          partnerInfo={activePartner ?? null}
           room={room}
           chatEnabled={chatEnabled}
           onSendText={onSendText}
           sendError={sendError}
+          messagePlaintext={messagePlaintext}
         />
       </div>
     </div>

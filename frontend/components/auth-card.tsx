@@ -8,7 +8,11 @@ import { generateChatKeyPair, encryptPrivateKey, decryptPrivateKey } from "@/lib
 type Tab = "login" | "register";
 
 type AuthCardProps = {
-  onAuthenticated?: (auth: { token: string; email: string }) => void;
+  onAuthenticated?: (auth: {
+    token: string;
+    email: string;
+    privateKeyJwk: JsonWebKey;
+  }) => void;
 };
 const tabBaseClass =
   "auth-card-tab rounded-lg cursor-pointer border px-4 py-3 text-base font-semibold transition-[background,color,border-color] duration-200";
@@ -37,35 +41,30 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
     setSubmitting(true);
     setFormError(null);
     try {
-      // 1. Panggil API Login
       const res = await login(loginEmail.trim(), loginPassword);
-      
-      // 2. Ambil data enkripsi kunci dari response (Pastikan API login Anda mengembalikan ini)
-      // Jika res.user tidak ada, Anda mungkin perlu menyesuaikan schema API di backend
-      if (res.user && res.user.encrypted_private_key) {
-        try {
-          const { encrypted_private_key, kdf_params } = res.user;
-          
-          // 3. Dekripsi Private Key menggunakan password login
-          const decryptedPrivKey = await decryptPrivateKey(
-            encrypted_private_key,
-            loginPassword,
-            kdf_params.iv,
-            kdf_params.salt,
-            kdf_params.iterations
-          );
-
-          // 4. Simpan hasil dekripsi ke localStorage agar bisa dipakai chat-page.tsx
-          localStorage.setItem("my_private_key", decryptedPrivKey);
-        } catch (decryptErr) {
-          console.error("Gagal dekripsi private key:", decryptErr);
-          // Jika dekripsi gagal, user tidak akan bisa baca/kirim pesan
-        }
+      if (!res.user?.encrypted_private_key || !res.user.kdf_params) {
+        throw new Error("Data enkripsi kunci tidak tersedia.");
       }
 
-      onAuthenticated?.({ token: res.token, email: loginEmail.trim() });
+      const { encrypted_private_key, kdf_params } = res.user;
+      const decryptedPrivKey = await decryptPrivateKey(
+        encrypted_private_key,
+        loginPassword,
+        kdf_params.iv,
+        kdf_params.salt,
+        kdf_params.iterations,
+      );
+      const privateKeyJwk = JSON.parse(decryptedPrivKey) as JsonWebKey;
+
+      onAuthenticated?.({
+        token: res.token,
+        email: loginEmail.trim(),
+        privateKeyJwk,
+      });
     } catch (err) {
-      setFormError("Email atau password salah.");
+      if (err instanceof ApiError) setFormError("Email atau password salah.");
+      else if (err instanceof Error) setFormError(err.message);
+      else setFormError("Gagal login.");
     } finally {
       setSubmitting(false);
     }
@@ -80,18 +79,17 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
     const email = registerEmail.trim();
     const password = registerPassword;
 
-    // A. Generate Kunci Komunikasi (ECDH)
     const keyPair = await generateChatKeyPair();
     
-    // B. Export ke format JWK (untuk dikirim/disimpan)
     const pubKeyJWK = await window.crypto.subtle.exportKey("jwk", keyPair.publicKey);
-    const privKeyJWK = await window.crypto.subtle.exportKey("jwk", keyPair.privateKey);
+    const privKeyJWK = (await window.crypto.subtle.exportKey(
+      "jwk",
+      keyPair.privateKey,
+    )) as JsonWebKey;
     const privKeyString = JSON.stringify(privKeyJWK);
 
-    // C. Enkripsi Private Key dengan Password
     const encryptedData = await encryptPrivateKey(privKeyString, password);
 
-    // D. Kirim ke Backend
     await register({
       email,
       password,
@@ -104,15 +102,14 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
       },
     });
 
-    // E. Login otomatis
     const res = await login(email, password);
 
-    // F. SIMPAN PRIVATE KEY KE LOCALSTORAGE (PENTING!)
-    // Simpan dalam keadaan plain (atau simpan password di memory) agar ChatPage bisa pakai
-    localStorage.setItem("my_private_key", privKeyString);
-
-    onAuthenticated?.({ token: res.token, email });
-  } catch (err: any) {
+    onAuthenticated?.({
+      token: res.token,
+      email,
+      privateKeyJwk: privKeyJWK,
+    });
+  } catch (err: unknown) {
     console.error(err);
     if (err instanceof ApiError) setFormError(err.message);
     else setFormError("Gagal daftar. Pastikan server berjalan.");

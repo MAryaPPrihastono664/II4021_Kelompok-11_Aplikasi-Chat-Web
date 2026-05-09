@@ -116,13 +116,12 @@ export async function fetchContacts(token: string) {
   return apiFetch<ContactListResponse>("/users/contacts", { token });
 }
 
-// Tambahkan ini di @/lib/api.ts atau file sejenis
 export async function fetchPublicKey(email: string, token: string) {
   const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/users/${email}/public-key`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) throw new Error("Gagal mengambil public key");
-  return res.json(); // Mengembalikan { public_key: "..." }
+  return res.json();
 }
 
 export async function sendMessage(token: string, data: { receiver_email: string, ciphertext: string, iv: string }) {
@@ -143,5 +142,5 @@ export async function fetchMessages(email: string, token: string) {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) throw new Error("Gagal mengambil pesan");
-  return res.json(); // Mengembalikan { messages: [...] }
+  return res.json();
 }
