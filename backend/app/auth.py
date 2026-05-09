@@ -69,23 +69,27 @@ def get_current_token_payload(
         raise HTTPException(status_code=401, detail="Missing bearer token")
 
     try:
-        parts = creds.credentials.split(".")
-        if len(parts) != 3:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        header = json.loads(base64url_decode(parts[0]))
-        alg = header.get("alg")
-        if not isinstance(alg, str) or not alg:
-            raise HTTPException(status_code=401, detail="Invalid token")
-
-        _, public_key_pem = _get_keypair_for_alg(alg)
-        verified = verify_jwt(
-            creds.credentials,
-            public_key_pem,
-            options={"algs": [alg]},
-        )
-        return verified["payload"]
+        return get_token_payload_from_token(creds.credentials)
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def get_token_payload_from_token(token: str) -> dict[str, Any]:
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    header = json.loads(base64url_decode(parts[0]))
+    alg = header.get("alg")
+    if not isinstance(alg, str) or not alg:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    _, public_key_pem = _get_keypair_for_alg(alg)
+    verified = verify_jwt(
+        token,
+        public_key_pem,
+        options={"algs": [alg]},
+    )
+    return verified["payload"]
 

@@ -84,8 +84,19 @@ export async function apiFetch<T>(
   return payload as T;
 }
 
-export type TokenResponse = { ok: boolean; token: string };
-export type ContactListResponse = { contacts: string[] };
+export type TokenResponse = { 
+  ok: boolean; 
+  token: string;
+  user?: {
+    email: string;
+    encrypted_private_key: string;
+    kdf_params: {
+      iv: string;
+      salt: string;
+      iterations: number;
+    };
+  };
+};export type ContactListResponse = { contacts: string[] };
 
 export async function login(email: string, password: string) {
   return apiFetch<TokenResponse>("/auth/login", { body: { email, password } });
@@ -105,3 +116,31 @@ export async function fetchContacts(token: string) {
   return apiFetch<ContactListResponse>("/users/contacts", { token });
 }
 
+export async function fetchPublicKey(email: string, token: string) {
+  const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/users/${email}/public-key`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error("Gagal mengambil public key");
+  return res.json();
+}
+
+export async function sendMessage(token: string, data: { receiver_email: string, ciphertext: string, iv: string }) {
+  const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error("Gagal mengirim pesan");
+  return res.json();
+}
+
+export async function fetchMessages(email: string, token: string) {
+  const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/messages/${email}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error("Gagal mengambil pesan");
+  return res.json();
+}

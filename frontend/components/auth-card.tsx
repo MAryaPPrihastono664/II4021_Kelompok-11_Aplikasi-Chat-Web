@@ -3,10 +3,16 @@
 import { useState, type FormEvent } from "react";
 import { ApiError, login, register } from "@/lib/api";
 
+import { generateChatKeyPair, encryptPrivateKey, decryptPrivateKey } from "@/lib/crypto";
+
 type Tab = "login" | "register";
 
 type AuthCardProps = {
-  onAuthenticated?: (auth: { token: string; email: string }) => void;
+  onAuthenticated?: (auth: {
+    token: string;
+    email: string;
+    privateKeyJwk: JsonWebKey;
+  }) => void;
 };
 const tabBaseClass =
   "auth-card-tab rounded-lg cursor-pointer border px-4 py-3 text-base font-semibold transition-[background,color,border-color] duration-200";
@@ -29,44 +35,88 @@ export function AuthCard({ onAuthenticated }: AuthCardProps) {
   const [registerPassword, setRegisterPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-
+  
   const onLoginSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setSubmitting(true);
     setFormError(null);
     try {
       const res = await login(loginEmail.trim(), loginPassword);
-      onAuthenticated?.({ token: res.token, email: loginEmail.trim() });
+      if (!res.user?.encrypted_private_key || !res.user.kdf_params) {
+        throw new Error("Data enkripsi kunci tidak tersedia.");
+      }
+
+      const { encrypted_private_key, kdf_params } = res.user;
+      const decryptedPrivKey = await decryptPrivateKey(
+        encrypted_private_key,
+        loginPassword,
+        kdf_params.iv,
+        kdf_params.salt,
+        kdf_params.iterations,
+      );
+      const privateKeyJwk = JSON.parse(decryptedPrivKey) as JsonWebKey;
+
+      onAuthenticated?.({
+        token: res.token,
+        email: loginEmail.trim(),
+        privateKeyJwk,
+      });
     } catch (err) {
-      if (err instanceof ApiError) setFormError(err.message);
-      else setFormError("Gagal masuk. Coba lagi.");
+      if (err instanceof ApiError) setFormError("Email atau password salah.");
+      else if (err instanceof Error) setFormError(err.message);
+      else setFormError("Gagal login.");
     } finally {
       setSubmitting(false);
     }
   };
 
   const onRegisterSubmit = async (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    setSubmitting(true);
-    setFormError(null);
-    try {
-      const email = registerEmail.trim();
-      await register({
-        email,
-        password: registerPassword,
-        public_key: "placeholder-public-key",
-        encrypted_private_key: "placeholder-encrypted-private-key",
-        kdf_params: { note: "placeholder" },
-      });
-      const res = await login(email, registerPassword);
-      onAuthenticated?.({ token: res.token, email });
-    } catch (err) {
-      if (err instanceof ApiError) setFormError(err.message);
-      else setFormError("Gagal daftar. Coba lagi.");
-    } finally {
-      setSubmitting(false);
-    }
-  };
+  e.preventDefault();
+  setSubmitting(true);
+  setFormError(null);
+  
+  try {
+    const email = registerEmail.trim();
+    const password = registerPassword;
+
+    const keyPair = await generateChatKeyPair();
+    
+    const pubKeyJWK = await window.crypto.subtle.exportKey("jwk", keyPair.publicKey);
+    const privKeyJWK = (await window.crypto.subtle.exportKey(
+      "jwk",
+      keyPair.privateKey,
+    )) as JsonWebKey;
+    const privKeyString = JSON.stringify(privKeyJWK);
+
+    const encryptedData = await encryptPrivateKey(privKeyString, password);
+
+    await register({
+      email,
+      password,
+      public_key: JSON.stringify(pubKeyJWK),
+      encrypted_private_key: encryptedData.ciphertext,
+      kdf_params: {
+        iv: encryptedData.iv,
+        salt: encryptedData.salt,
+        iterations: encryptedData.iterations
+      },
+    });
+
+    const res = await login(email, password);
+
+    onAuthenticated?.({
+      token: res.token,
+      email,
+      privateKeyJwk: privKeyJWK,
+    });
+  } catch (err: unknown) {
+    console.error(err);
+    if (err instanceof ApiError) setFormError(err.message);
+    else setFormError("Gagal daftar. Pastikan server berjalan.");
+  } finally {
+    setSubmitting(false);
+  }
+};
 
   return (
     <div className="auth-card-container min-h-[400px] w-full max-w-xl rounded-2xl border border-gray-200 bg-white p-10 shadow-[0_4px_16px_rgba(0,0,0,0.1)]">

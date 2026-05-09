@@ -1,29 +1,44 @@
 export type StoredAuth = { token: string; email: string };
 
-const KEY = "chatweb.auth";
+const TOKEN_KEY = "chatweb.token";
+const EMAIL_KEY = "chatweb.email";
+
+function getCookie(name: string) {
+  if (typeof document === "undefined") return null;
+  const prefix = `${name}=`;
+  const part = document.cookie
+    .split(";")
+    .map((v) => v.trim())
+    .find((v) => v.startsWith(prefix));
+  if (!part) return null;
+  return decodeURIComponent(part.slice(prefix.length));
+}
+
+function setCookie(name: string, value: string, maxAgeSeconds: number) {
+  if (typeof document === "undefined") return;
+  document.cookie = `${name}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAgeSeconds}; SameSite=Lax`;
+}
+
+function clearCookie(name: string) {
+  if (typeof document === "undefined") return;
+  document.cookie = `${name}=; Path=/; Max-Age=0; SameSite=Lax`;
+}
 
 export function getStoredAuth(): StoredAuth | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = window.localStorage.getItem(KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<StoredAuth>;
-    if (typeof parsed.token !== "string" || typeof parsed.email !== "string") {
-      return null;
-    }
-    return { token: parsed.token, email: parsed.email };
-  } catch {
+  const token = getCookie(TOKEN_KEY);
+  const email = getCookie(EMAIL_KEY);
+  if (!token || !email) {
     return null;
   }
+  return { token, email };
 }
 
 export function setStoredAuth(auth: StoredAuth) {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(KEY, JSON.stringify(auth));
+  setCookie(TOKEN_KEY, auth.token, 60 * 60 * 24);
+  setCookie(EMAIL_KEY, auth.email, 60 * 60 * 24);
 }
 
 export function clearStoredAuth() {
-  if (typeof window === "undefined") return;
-  window.localStorage.removeItem(KEY);
+  clearCookie(TOKEN_KEY);
+  clearCookie(EMAIL_KEY);
 }
-
