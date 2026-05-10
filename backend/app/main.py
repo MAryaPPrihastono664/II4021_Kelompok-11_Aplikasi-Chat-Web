@@ -14,7 +14,7 @@ from .auth import create_access_token, get_current_token_payload, get_token_payl
 from .db import AsyncSessionLocal, get_db
 from .models import Message, User
 from .utils import generate_salt, hash_password, verify_password
-from sqlalchemy import and_, select, or_  # Tambahkan or_
+from sqlalchemy import and_, select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from collections import defaultdict
 from typing import Any
@@ -113,7 +113,7 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
         "user": {
             "email": user.email,
             "encrypted_private_key": user.encrypted_private_key,
-            "kdf_params": user.kdf_params # Ini akan otomatis jadi JSON object
+            "kdf_params": user.kdf_params
         }
     }
 

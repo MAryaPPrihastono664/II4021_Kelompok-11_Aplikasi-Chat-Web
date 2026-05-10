@@ -8,6 +8,17 @@ import {
   useState,
 } from "react";
 import { ApiError, fetchContacts, fetchPublicKey, fetchMessages } from "@/lib/api";
+import {
+  bufferToHex,
+  decryptChatPayload,
+  conversationHkdfInfoBytes,
+  conversationInfoString,
+  conversationHkdfSaltBytes,
+  deriveConversationAesKey,
+  deriveConversationKeyMaterialBits,
+  deriveEcdhSharedSecretBits,
+  encryptChatPayload,
+} from "@/lib/crypto";
 
 type Message = {
   id: string | number | null;
@@ -45,13 +56,6 @@ export type PartnerInfo = {
   storeLogoPath: string | null;
 };
 
-const hexToBuffer = (hex: string) => new Uint8Array(hex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
-const bufferToHex = (buf: ArrayBuffer) => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
-
-function utf8Bytes(v: string) {
-  return new TextEncoder().encode(v);
-}
-
 function websocketBaseUrl() {
   const base = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
   const normalized = base.replace(/\/+$/, "");
@@ -64,60 +68,12 @@ function websocketBaseUrl() {
   return normalized;
 }
 
-async function deriveConversationAesKey(
-  myPrivateKeyJWK: JsonWebKey,
-  partnerPublicKeyJWK: JsonWebKey,
-  myEmail: string,
-  partnerEmail: string,
-) {
-  const { key_ops: _privKeyOps, ...privateJwkClean } = myPrivateKeyJWK;
-  void _privKeyOps;
-  const privateKey = await window.crypto.subtle.importKey(
-    "jwk",
-    privateJwkClean,
-    { name: "ECDH", namedCurve: "P-256" },
-    false,
-    ["deriveBits"],
-  );
-  const { key_ops: _pubKeyOps, ...publicJwkClean } = partnerPublicKeyJWK;
-  void _pubKeyOps;
-  const publicKey = await window.crypto.subtle.importKey(
-    "jwk",
-    publicJwkClean,
-    { name: "ECDH", namedCurve: "P-256" },
-    false,
-    [],
-  );
-  const sharedSecret = await window.crypto.subtle.deriveBits(
-    { name: "ECDH", public: publicKey },
-    privateKey,
-    256,
-  );
+const DECRYPTION_ERROR_PREFIX = "[DECRYPTION ERROR";
+const DECRYPTION_ERROR_MESSAGE =
+  "[DECRYPTION ERROR: Kunci tidak valid atau data rusak]";
 
-  const hkdfBaseKey = await window.crypto.subtle.importKey(
-    "raw",
-    sharedSecret,
-    "HKDF",
-    false,
-    ["deriveKey"],
-  );
-  const info = utf8Bytes(
-    `chat:${[myEmail, partnerEmail].sort().join("|")}:aes-256-gcm`,
-  );
-  const salt = utf8Bytes("chat-webapp-hkdf-salt-v1");
-
-  return window.crypto.subtle.deriveKey(
-    {
-      name: "HKDF",
-      hash: "SHA-256",
-      salt,
-      info,
-    },
-    hkdfBaseKey,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"],
-  );
+function isDecryptionErrorText(value: string) {
+  return value.startsWith(DECRYPTION_ERROR_PREFIX);
 }
 
 function formatTime(timestamp: number) {
@@ -298,23 +254,145 @@ function ChatSidebar({
   );
 }
 
-async function decryptMessage(
-  ciphertextHex: string,
-  ivHex: string,
-  aesKey: CryptoKey,
-): Promise<string> {
-  try {
-    const decryptedBuffer = await window.crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: hexToBuffer(ivHex) },
-      aesKey,
-      hexToBuffer(ciphertextHex),
-    );
+type ConversationCryptoProof = {
+  generatedAt: string;
+  partnerEmail: string;
+  myPublicFingerprint: string;
+  partnerPublicFingerprint: string;
+  ecdhSharedSecret1Hex: string;
+  ecdhSharedSecret2Hex: string;
+  ecdhConsistent: boolean;
+  hkdfSaltHex: string;
+  hkdfInfoText: string;
+  hkdfInfoHex: string;
+  hkdfKeyMaterial1Hex: string;
+  hkdfKeyMaterial2Hex: string;
+  hkdfConsistent: boolean;
+};
 
-    return new TextDecoder().decode(decryptedBuffer);
-  } catch (error) {
-    console.error("Decryption failed:", error);
-    return "[DECRYPTION ERROR: Kunci tidak valid atau data rusak]";
-  }
+type MessageCryptoEvidence = {
+  generatedAt: string;
+  partnerEmail: string;
+  direction: "sent" | "received";
+  messageId: string;
+  plaintext: string;
+  ciphertextHex: string;
+  ivHex: string;
+  decryptedPlaintext: string;
+  decryptConsistent: boolean;
+  decryptionFailed: boolean;
+};
+
+async function keyFingerprintFromJwk(jwk: JsonWebKey) {
+  const canonical = JSON.stringify({
+    kty: jwk.kty,
+    crv: jwk.crv,
+    x: jwk.x,
+    y: jwk.y,
+  });
+  const digest = await window.crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(canonical),
+  );
+  return bufferToHex(digest);
+}
+
+function CryptoDemoPanel({
+  activePartnerEmail,
+  proof,
+  latestSent,
+  latestReceived,
+  error,
+}: {
+  activePartnerEmail: string | null;
+  proof: ConversationCryptoProof | null;
+  latestSent: MessageCryptoEvidence | null;
+  latestReceived: MessageCryptoEvidence | null;
+  error: string | null;
+}) {
+  return (
+    <details className="border-b border-[#E5E5E5] bg-[#fffef8] px-4 py-3" open>
+      <summary className="cursor-pointer text-sm font-semibold text-[#3b3b3b]">
+        Bukti Kriptografi Chat (jalur produksi)
+      </summary>
+      <div className="mt-3 flex flex-col gap-3 text-sm text-[#333]">
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="rounded bg-[#eef9ef] px-2 py-1 text-xs font-semibold text-[#2f7b34]">
+            deriveConversationAesKey dipakai chat + panel
+          </span>
+          <span className="text-xs text-[#666]">
+            Partner aktif: {activePartnerEmail ?? "pilih chat dulu"}
+          </span>
+        </div>
+        <p className="m-0 text-xs text-[#666]">
+          Nilai di bawah diambil dari proses enkripsi/dekripsi pesan nyata (kirim/terima), bukan snapshot statik.
+        </p>
+        {error ? (
+          <div className="rounded border border-red-200 bg-red-50 p-3 text-red-700">
+            {error}
+          </div>
+        ) : null}
+        {proof ? (
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="rounded border border-[#E5E5E5] bg-white p-3">
+              <p className="m-0 font-semibold">ECDH + HKDF</p>
+              <p className="m-0 mt-1 break-all text-xs">My fingerprint: {proof.myPublicFingerprint}</p>
+              <p className="m-0 mt-1 break-all text-xs">Partner fingerprint: {proof.partnerPublicFingerprint}</p>
+              <p className="m-0 mt-1 break-all text-xs">Shared secret #1: {proof.ecdhSharedSecret1Hex}</p>
+              <p className="m-0 mt-1 break-all text-xs">Shared secret #2: {proof.ecdhSharedSecret2Hex}</p>
+              <p className="m-0 mt-1 text-xs">
+                ECDH konsisten: {proof.ecdhConsistent ? "YA" : "TIDAK"}
+              </p>
+              <p className="m-0 mt-1 break-all text-xs">HKDF salt (hex): {proof.hkdfSaltHex}</p>
+              <p className="m-0 mt-1 break-all text-xs">HKDF info: {proof.hkdfInfoText}</p>
+              <p className="m-0 mt-1 break-all text-xs">HKDF info (hex): {proof.hkdfInfoHex}</p>
+              <p className="m-0 mt-1 break-all text-xs">Key material #1: {proof.hkdfKeyMaterial1Hex}</p>
+              <p className="m-0 mt-1 break-all text-xs">Key material #2: {proof.hkdfKeyMaterial2Hex}</p>
+              <p className="m-0 mt-1 text-xs">
+                HKDF konsisten: {proof.hkdfConsistent ? "YA" : "TIDAK"}
+              </p>
+            </div>
+            <div className="rounded border border-[#E5E5E5] bg-white p-3">
+              <p className="m-0 font-semibold">Event pesan terakhir</p>
+              {latestSent ? (
+                <>
+                  <p className="m-0 mt-2 text-xs font-semibold text-[#2f7b34]">Kirim terakhir</p>
+                  <p className="m-0 mt-1 break-all text-xs">Plaintext: {latestSent.plaintext}</p>
+                  <p className="m-0 mt-1 break-all text-xs">Ciphertext: {latestSent.ciphertextHex}</p>
+                  <p className="m-0 mt-1 break-all text-xs">IV: {latestSent.ivHex}</p>
+                  <p className="m-0 mt-1 break-all text-xs">Decrypt self-check: {latestSent.decryptedPlaintext}</p>
+                  <p className="m-0 mt-1 text-xs">
+                    Konsisten: {latestSent.decryptConsistent ? "YA" : "TIDAK"}
+                  </p>
+                </>
+              ) : (
+                <p className="m-0 mt-1 text-xs text-[#777]">Belum ada pesan terkirim pada sesi ini.</p>
+              )}
+              {latestReceived ? (
+                <>
+                  <p className="m-0 mt-3 text-xs font-semibold text-[#1f4f8b]">Terima terakhir</p>
+                  <p
+                    className={`m-0 mt-1 text-xs font-semibold ${
+                      latestReceived.decryptionFailed ? "text-red-700" : "text-[#1f4f8b]"
+                    }`}
+                  >
+                    Status: {latestReceived.decryptionFailed ? "Dekripsi gagal" : "Dekripsi berhasil"}
+                  </p>
+                  <p className="m-0 mt-1 break-all text-xs">Ciphertext: {latestReceived.ciphertextHex}</p>
+                  <p className="m-0 mt-1 break-all text-xs">IV: {latestReceived.ivHex}</p>
+                  <p className="m-0 mt-1 break-all text-xs">
+                    Plaintext hasil decrypt: {latestReceived.plaintext}
+                  </p>
+                </>
+              ) : (
+                <p className="m-0 mt-3 text-xs text-[#777]">Belum ada pesan diterima pada sesi ini.</p>
+              )}
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </details>
+  );
 }
 
 function ChatDashboard({
@@ -394,6 +472,7 @@ function ChatDashboard({
           sorted.map((m) => {
             const msgId = String(m.id ?? `t-${m.tracking}`);
             const displayContent = messagePlaintext[msgId] || "Mendekripsi...";
+            const isDecryptionError = isDecryptionErrorText(displayContent);
 
             return (
               <div
@@ -401,11 +480,24 @@ function ChatDashboard({
                 className={`flex flex-col gap-2 ${m.fromUserId === userId ? "items-end" : "items-start"}`}
               >
                 <div
-                  className={`flex max-w-[70%] flex-col rounded-xl px-4 py-3 text-black shadow-sm ${
-                    m.fromUserId === userId ? "items-end bg-[#D9FDD3]" : "bg-white"
+                  className={`flex max-w-[70%] flex-col rounded-xl px-4 py-3 shadow-sm ${
+                    isDecryptionError
+                      ? "border border-red-300 bg-red-50 text-red-800"
+                      : m.fromUserId === userId
+                        ? "items-end bg-[#D9FDD3] text-black"
+                        : "bg-white text-black"
                   }`}
                 >
-                  <p className="hyphens-auto m-0 wrap-break-word text-[0.9375rem] [word-break:break-word]">
+                  <p
+                    className={`hyphens-auto m-0 wrap-break-word text-[0.9375rem] [word-break:break-word] ${
+                      isDecryptionError ? "font-semibold text-red-800" : ""
+                    }`}
+                  >
+                    {isDecryptionError ? (
+                      <span className="mr-1 inline-flex items-center gap-1 align-middle">
+                        <i className="bx bx-error-circle text-base" />
+                      </span>
+                    ) : null}
                     {displayContent}
                   </p>
                   
@@ -495,6 +587,10 @@ export function ChatPage({
   const [messagePlaintext, setMessagePlaintext] = useState<
     Record<string, string>
   >({});
+  const [conversationProof, setConversationProof] = useState<ConversationCryptoProof | null>(null);
+  const [latestSentEvidence, setLatestSentEvidence] = useState<MessageCryptoEvidence | null>(null);
+  const [latestReceivedEvidence, setLatestReceivedEvidence] = useState<MessageCryptoEvidence | null>(null);
+  const [demoError, setDemoError] = useState<string | null>(null);
 
   const refreshContacts = () => {
     setContactsLoading(true);
@@ -654,7 +750,7 @@ export function ChatPage({
     return rawKey as JsonWebKey;
   }, []);
 
-  const ensureAesKeyForPartner = useCallback(async (partnerEmail: string) => {
+  const ensurePartnerPublicKey = useCallback(async (partnerEmail: string) => {
     let partnerPublicKey = partnerKeysByEmail.get(partnerEmail) ?? null;
     if (!partnerPublicKey) {
       const keyData = await fetchPublicKey(partnerEmail, token);
@@ -665,7 +761,11 @@ export function ChatPage({
         return next;
       });
     }
+    return partnerPublicKey;
+  }, [parsePublicKeyJwk, partnerKeysByEmail, token]);
 
+  const ensureAesKeyForPartner = useCallback(async (partnerEmail: string) => {
+    const partnerPublicKey = await ensurePartnerPublicKey(partnerEmail);
     let aesKey = aesKeysByEmail.get(partnerEmail) ?? null;
     if (!aesKey) {
       aesKey = await deriveConversationAesKey(
@@ -687,16 +787,93 @@ export function ChatPage({
   }, [
     aesKeysByEmail,
     email,
+    ensurePartnerPublicKey,
     myPrivateKeyJwk,
-    parsePublicKeyJwk,
-    partnerKeysByEmail,
-    token,
+  ]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const buildProof = async () => {
+      if (!activePartner) {
+        setConversationProof(null);
+        setLatestSentEvidence(null);
+        setLatestReceivedEvidence(null);
+        return;
+      }
+      if (!myPrivateKeyJwk.x || !myPrivateKeyJwk.y) {
+        setDemoError("Public point pada private JWK tidak tersedia untuk demo.");
+        return;
+      }
+      try {
+        setDemoError(null);
+        const partnerEmail = activePartner.name;
+        const partnerPublicKey = await ensurePartnerPublicKey(partnerEmail);
+        const sharedSecret1 = await deriveEcdhSharedSecretBits(
+          myPrivateKeyJwk,
+          partnerPublicKey,
+        );
+        const sharedSecret2 = await deriveEcdhSharedSecretBits(
+          myPrivateKeyJwk,
+          partnerPublicKey,
+        );
+        const keyMaterial1 = await deriveConversationKeyMaterialBits(
+          sharedSecret1,
+          email,
+          partnerEmail,
+        );
+        const keyMaterial2 = await deriveConversationKeyMaterialBits(
+          sharedSecret2,
+          email,
+          partnerEmail,
+        );
+        const myPublicJwk: JsonWebKey = {
+          kty: "EC",
+          crv: "P-256",
+          x: myPrivateKeyJwk.x,
+          y: myPrivateKeyJwk.y,
+        };
+        if (cancelled) return;
+        const keyMat1Hex = bufferToHex(keyMaterial1);
+        setConversationProof({
+          generatedAt: new Date().toISOString(),
+          partnerEmail,
+          myPublicFingerprint: await keyFingerprintFromJwk(myPublicJwk),
+          partnerPublicFingerprint: await keyFingerprintFromJwk(partnerPublicKey),
+          ecdhSharedSecret1Hex: bufferToHex(sharedSecret1),
+          ecdhSharedSecret2Hex: bufferToHex(sharedSecret2),
+          ecdhConsistent: bufferToHex(sharedSecret1) === bufferToHex(sharedSecret2),
+          hkdfSaltHex: bufferToHex(conversationHkdfSaltBytes()),
+          hkdfInfoText: conversationInfoString(email, partnerEmail),
+          hkdfInfoHex: bufferToHex(conversationHkdfInfoBytes(email, partnerEmail)),
+          hkdfKeyMaterial1Hex: keyMat1Hex,
+          hkdfKeyMaterial2Hex: bufferToHex(keyMaterial2),
+          hkdfConsistent: keyMat1Hex === bufferToHex(keyMaterial2),
+        });
+      } catch (err) {
+        if (cancelled) return;
+        console.error("Gagal menghitung proof kunci percakapan:", err);
+        setConversationProof(null);
+        setDemoError(
+          err instanceof Error ? err.message : "Gagal membentuk proof percakapan.",
+        );
+      }
+    };
+    void buildProof();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activePartner,
+    email,
+    ensurePartnerPublicKey,
+    myPrivateKeyJwk,
   ]);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       const toMerge: Record<string, string> = {};
+      let latestIncomingForActive: MessageCryptoEvidence | null = null;
       for (const [partnerId, roomMap] of rooms) {
         const partner = partnerById.get(partnerId);
         if (!partner) continue;
@@ -712,11 +889,52 @@ export function ChatPage({
         for (const m of roomMap.values()) {
           if (!m.ciphertext || !m.iv) continue;
           const msgKey = String(m.id ?? `t-${m.tracking}`);
-          toMerge[msgKey] = await decryptMessage(
-            m.ciphertext,
-            m.iv,
-            aesKey,
-          );
+          try {
+            const plaintext = await decryptChatPayload(m.ciphertext, m.iv, aesKey);
+            toMerge[msgKey] = plaintext;
+            if (
+              activePartnerUserId === partnerId &&
+              m.fromUserId !== 0 &&
+              (!latestIncomingForActive ||
+                Date.parse(m.createdAt) >=
+                  Date.parse(latestIncomingForActive.generatedAt))
+            ) {
+              latestIncomingForActive = {
+                generatedAt: m.createdAt,
+                partnerEmail: partner.name,
+                direction: "received",
+                messageId: msgKey,
+                plaintext,
+                ciphertextHex: m.ciphertext,
+                ivHex: m.iv,
+                decryptedPlaintext: plaintext,
+                decryptConsistent: true,
+                decryptionFailed: false,
+              };
+            }
+          } catch {
+            toMerge[msgKey] = DECRYPTION_ERROR_MESSAGE;
+            if (
+              activePartnerUserId === partnerId &&
+              m.fromUserId !== 0 &&
+              (!latestIncomingForActive ||
+                Date.parse(m.createdAt) >=
+                  Date.parse(latestIncomingForActive.generatedAt))
+            ) {
+              latestIncomingForActive = {
+                generatedAt: m.createdAt,
+                partnerEmail: partner.name,
+                direction: "received",
+                messageId: msgKey,
+                plaintext: DECRYPTION_ERROR_MESSAGE,
+                ciphertextHex: m.ciphertext,
+                ivHex: m.iv,
+                decryptedPlaintext: DECRYPTION_ERROR_MESSAGE,
+                decryptConsistent: false,
+                decryptionFailed: true,
+              };
+            }
+          }
         }
       }
       if (cancelled) return;
@@ -731,11 +949,22 @@ export function ChatPage({
         }
         return changed ? next : prev;
       });
+      if (latestIncomingForActive) {
+        setLatestReceivedEvidence((prev) => {
+          if (
+            prev?.messageId === latestIncomingForActive.messageId &&
+            prev.generatedAt === latestIncomingForActive.generatedAt
+          ) {
+            return prev;
+          }
+          return latestIncomingForActive;
+        });
+      }
     })();
     return () => {
       cancelled = true;
     };
-  }, [rooms, aesKeysByEmail, partnerById, ensureAesKeyForPartner]);
+  }, [rooms, aesKeysByEmail, partnerById, ensureAesKeyForPartner, activePartnerUserId]);
 
   const refreshMessages = useCallback(async () => {
     if (!activePartner || !activePartnerUserId) return;
@@ -779,14 +1008,24 @@ export function ChatPage({
 
     try {
       const aesKey = await ensureAesKeyForPartner(activePartner.name);
-
-      const iv = window.crypto.getRandomValues(new Uint8Array(12));
-      const encodedContent = new TextEncoder().encode(text);
-      const ciphertext = await window.crypto.subtle.encrypt(
-        { name: "AES-GCM", iv },
+      const encrypted = await encryptChatPayload(text, aesKey);
+      const decryptedSelfCheck = await decryptChatPayload(
+        encrypted.ciphertextHex,
+        encrypted.ivHex,
         aesKey,
-        encodedContent,
       );
+      setLatestSentEvidence({
+        generatedAt: new Date().toISOString(),
+        partnerEmail: activePartner.name,
+        direction: "sent",
+        messageId: `local-${Date.now()}`,
+        plaintext: text,
+        ciphertextHex: encrypted.ciphertextHex,
+        ivHex: encrypted.ivHex,
+        decryptedPlaintext: decryptedSelfCheck,
+        decryptConsistent: decryptedSelfCheck === text,
+        decryptionFailed: false,
+      });
 
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
         throw new Error("Koneksi realtime terputus. Coba beberapa detik lagi.");
@@ -796,8 +1035,8 @@ export function ChatPage({
         JSON.stringify({
           type: "send_message",
           receiver_email: activePartner.name,
-          ciphertext: bufferToHex(ciphertext),
-          iv: bufferToHex(iv.buffer),
+          ciphertext: encrypted.ciphertextHex,
+          iv: encrypted.ivHex,
         }),
       );
     } catch (err: unknown) {
@@ -836,6 +1075,13 @@ export function ChatPage({
           Keluar
         </button>
       </div>
+      <CryptoDemoPanel
+        activePartnerEmail={activePartner?.name ?? null}
+        proof={conversationProof}
+        latestSent={latestSentEvidence}
+        latestReceived={latestReceivedEvidence}
+        error={demoError}
+      />
       <div className="flex min-h-0 flex-1 overflow-hidden">
         <ChatSidebar
           rooms={rooms}

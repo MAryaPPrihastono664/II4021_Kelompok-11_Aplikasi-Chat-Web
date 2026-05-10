@@ -15,3 +15,7 @@ python-multipart
 pydantic[email]
 pydantic-settings
 python-dotenv
+
+pytest
+pytest-asyncio
+httpx
