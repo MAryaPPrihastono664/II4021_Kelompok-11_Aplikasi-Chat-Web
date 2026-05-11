@@ -79,50 +79,34 @@ Data Postgres bertahan di volume bernama `pgdata` kecuali volume tersebut dihapu
 
 ---
 
-## Backend tanpa Docker (virtual environment)
+## Menguji backend (`pytest`)
 
-Untuk menjalankan **`pytest`**, **`uvicorn`**, atau skrip lain di mesin lokal tanpa container, disarankan memakai **virtual environment** Python di dalam **`backend/`** supaya paket dari `requirements.txt` tidak mengotori Python sistem atau project lain.
+**Menjalankan aplikasi (API + frontend + basis data) tetap lewat Docker** seperti bagian di atas. Instruksi virtual environment di bawah hanya untuk **menjalankan tes otomatis** di mesin host, supaya paket dari `requirements.txt` tidak bercampur dengan Python sistem.
+
+Dari folder **`backend/`**, buat dan aktifkan virtual environment:
 
 ```bash
 cd backend
 python -m venv .venv
 ```
 
-Aktifkan lingkungan virtual:
-
-| Platform | Perintah |
+| Platform | Aktivasi |
 |----------|-----------|
 | Windows (PowerShell) | `.\.venv\Scripts\Activate.ps1` |
 | Windows (cmd) | `.venv\Scripts\activate.bat` |
 | Linux / macOS | `source .venv/bin/activate` |
 
-Setelah aktif (biasanya prompt menampilkan `(.venv)`), pasang dependensi:
+Setelah aktif (biasanya prompt menampilkan `(.venv)`):
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Menjalankan API secara lokal (PostgreSQL harus dapat dijangkau sesuai `DATABASE_URL` di `.env`, misalnya instance Docker Compose yang hanya service `db`):
-
-```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
----
-
-## Menguji modul JWT (`pytest`)
-
-Pengujian JWT memakai **`backend/pytest.ini`** (`testpaths = test`, `pythonpath = .`) dan hanya menguji `app.jwt_lib` dengan kunci EC yang dihasilkan di memori — **tidak memerlukan Docker, PostgreSQL, atau berkas `.env`.** Aktifkan **venv** backend seperti di atas, lalu:
+Pengujian memakai **`backend/pytest.ini`** (`testpaths = test`, `pythonpath = .`). Contoh untuk modul JWT: hanya menguji `app.jwt_lib` dengan kunci EC di memori — **stack aplikasi, PostgreSQL, dan `.env` tidak perlu dijalankan untuk tes tersebut.**
 
 ```bash
 cd backend
 python -m pytest test/test_jwt.py -v
-```
-
-Menjalankan seluruh tes di `backend/test/`:
-
-```bash
-python -m pytest -v
 ```
 
 ---
